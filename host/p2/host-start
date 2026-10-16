@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+mkdir -p /var/lib/elasticpc
+/usr/local/bin/elasticctl doctor --json > /var/lib/elasticpc/doctor.json || true
+/usr/bin/python3 -c 'import json; json.load(open("/var/lib/elasticpc/doctor.json"))'
+echo ELASTICPC_HOST_READY > /dev/ttyS0
+# Test commands are accepted only when an explicit lab seed is attached.
+mkdir -p /run/elasticpc-seed
+if mount -o ro /dev/disk/by-label/cidata /run/elasticpc-seed 2>/dev/null; then
+ mode=$(cat /run/elasticpc-seed/elasticpc-test-mode 2>/dev/null || true)
+ case "$mode" in
+ normal) virsh -c qemu:///system list --all > /var/lib/elasticpc/libvirt-domains.txt; qemu-system-x86_64 --version > /var/lib/elasticpc/qemu-version.txt; echo ELASTICPC_P2_NORMAL_OK > /dev/ttyS0; systemctl poweroff --no-block ;;
+ arm-recovery) grub-reboot elasticpc-recovery; echo ELASTICPC_P2_RECOVERY_ARMED > /dev/ttyS0; systemctl poweroff --no-block ;;
+ uninstall) /usr/lib/elasticpc/uninstall; echo ELASTICPC_P2_UNINSTALL_OK > /dev/ttyS0; systemctl poweroff --no-block ;;
+ esac
+fi

@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Read-only USB controller inventory. Does not detach or assign any device."""
+import argparse,json,re
+from pathlib import Path
+SYS=Path('/sys')
+def read(p):
+ try:return p.read_text().strip()
+ except OSError:return None
+def inventory():
+ controllers={}
+ for p in sorted((SYS/'bus/pci/devices').glob('*')):
+  if read(p/'class')!='0x0c0330':continue
+  group=p/'iommu_group'
+  members=sorted(x.name for x in (group/'devices').glob('*'))
+  controllers[p.name]={'pci':p.name,'group':group.resolve().name if group.exists() else None,
+                       'members':members,'devices':[],'blocked_reasons':[]}
+ for p in sorted((SYS/'bus/usb/devices').glob('*')):
+  if ':' in p.name or p.name.startswith('usb'):continue
+  parents=[x for x in p.resolve().parts if re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]',x)]
+  if not parents or parents[-1] not in controllers:continue
+  classes={read(p/'bDeviceClass')}
+  classes.update(read(x/'bInterfaceClass') for x in (SYS/'bus/usb/devices').glob(p.name+':*'))
+  controllers[parents[-1]]['devices'].append({'port':p.name,'vid':read(p/'idVendor'),'pid':read(p/'idProduct'),
+    'product':read(p/'product'),'serial':read(p/'serial'),'classes':sorted(c for c in classes if c)})
+ for c in controllers.values():
+  if c['members']!=[c['pci']]:c['blocked_reasons'].append('IOMMU group is absent or not isolated to this controller')
+  if any('08' in d['classes'] for d in c['devices']):c['blocked_reasons'].append('Controller contains USB storage: never detach while Host/Guest disks depend on it')
+  c['candidate_only']=not c['blocked_reasons']
+ return list(controllers.values())
+def main():
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('--controller')
+ a=p.parse_args();rows=inventory()
+ if a.controller:
+  rows=[r for r in rows if r['pci']==a.controller]
+  if not rows:raise SystemExit('Controller not found')
+ print(json.dumps({'read_only':True,'controllers':rows,'note':'Candidate is NOT approval. Map physical ports, preserve Host input, and recheck from USB Host before VFIO assignment.'},indent=2))
+if __name__=='__main__':main()

@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+exec > /dev/ttyS0 2>&1
+echo 'ElasticPC recovery: read-only diagnostics; no automatic disk repair.'
+/usr/local/bin/elasticctl readiness --json > /run/elasticpc-recovery.json
+/usr/bin/python3 -c 'import json; json.load(open("/run/elasticpc-recovery.json"))'
+cat /run/elasticpc-recovery.json
+if grep -q 'systemd.unit=elasticpc-recovery.target' /proc/cmdline; then
+ echo ELASTICPC_P2_RECOVERY_OK
+fi
+mkdir -p /run/elasticpc-seed
+if mount -o ro /dev/disk/by-label/cidata /run/elasticpc-seed 2>/dev/null; then
+ [ "$(cat /run/elasticpc-seed/elasticpc-test-mode 2>/dev/null || true)" != recovery ] || systemctl poweroff --no-block
+fi

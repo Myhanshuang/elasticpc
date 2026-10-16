@@ -1,0 +1,43 @@
+USB input assignment by device name (physical handoff not yet verified)
+
+List devices, names and eligibility:
+  epc-input list
+  epc-input list --json
+
+Assign selected devices to running Windows:
+  epc-input give windows "G502 HERO SE" "A87 Keyboard"
+
+Additional give calls add devices to the same Windows session.
+Names match exactly (case-insensitive); there is no substring matching.
+If two devices share a name, use the selector shown by list:
+  epc-input give windows "A87 Keyboard@1-1.4"
+Re-run list after changing USB ports; do not assume a port selector is permanent.
+
+From the laptop keyboard on Host, return only one selected device:
+  epc-input release windows "G502 HERO SE"
+Return all devices assigned by this tool:
+  epc-input release windows
+Show current assignments:
+  epc-input status windows
+
+The laptop i8042 keyboard and I2C touchpad remain with Host.
+Only pure USB HID devices are eligible in this version. Storage, hubs,
+audio/HID composite devices and cameras are listed but cannot be assigned.
+Assignment is per physical USB device, including all its HID interfaces.
+A combined wireless keyboard/mouse receiver is therefore assigned together.
+
+If deletion is pending, the lease remains. Repeat release to confirm;
+the tool does not force-bind a device still owned by QEMU.
+If an additional assignment fails, prior assigned devices remain assigned.
+These commands work only inside the approved external USB Host.
+
+Start Windows with explicitly selected input devices:
+  epc start windows --mode direct --gpu --input "A87 Keyboard" --input "G502 HERO SE"
+Names must match `epc-input list`; repeated names are rejected. For duplicate
+product names use the name@port selector printed by the list command.
+The laptop keyboard and touchpad remain with Host.
+After startup, check `epc status windows` for input_status/input_error.
+If assignment fails Windows remains running; correct it with epc-input give.
+Reclaim from the Host terminal:
+  epc-input release windows
+If deletion is pending, repeat release after the device is removed.

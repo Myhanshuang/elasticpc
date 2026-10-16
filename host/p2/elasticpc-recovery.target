@@ -1,0 +1,5 @@
+[Unit]
+Description=ElasticPC recovery diagnostics
+Requires=basic.target elasticpc-recovery.service
+After=basic.target elasticpc-recovery.service
+AllowIsolate=yes

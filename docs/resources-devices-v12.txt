@@ -1,0 +1,56 @@
+ElasticPC resource/device test instructions (2026-10-16)
+
+Both Guests write original disks. Changes cannot be discarded.
+RAM: Windows 16384 MiB, Manjaro 10240 MiB, Host/QEMU overhead reserve 4096 MiB.
+No new swap is enabled. Admission refuses insufficient physical/available RAM.
+CPU: Windows vCPU0..7 -> Host CPU2..9 (4 SMT cores).
+     Manjaro vCPU0..5 -> Host CPU10..15 (3 SMT cores).
+     QEMU emulator/I/O threads -> CPU0,1.
+This is vCPU affinity, not complete kernel IRQ/Host workload isolation.
+
+1. List external devices:
+   epc-device list
+2. Windows with NVIDIA, onboard 3.5mm audio, keyboard and 2.4G receiver:
+   epc start windows --mode direct --gpu --voice-card --device "A87 Keyboard" --device "EWEADN X23 carbon"
+   epc status windows
+   epc console windows
+   epc-device status windows
+3. Start Manjaro:
+   epc start linux --mode direct
+   epc status linux
+4. Hot-assign a new USB HID/audio device by its exact name:
+   epc-device give windows "DEVICE NAME"
+   epc-device give linux "DEVICE NAME"
+   epc-device release windows "DEVICE NAME"
+   epc-device release windows
+   epc-device status windows
+   Duplicate names: use name@port from list. A device cannot belong to both Guests.
+   New peripherals stay with Host until explicitly assigned. After unplug/replug,
+   release the old lease then give again; do not assume the USB address is stable.
+   If deletion is pending, repeat release after QEMU completes removal.
+   epc-input remains an alias; --input remains an alias for --device.
+5. Receiver compatibility test if attached_now is true but pointer does not move:
+   epc-device release windows "EWEADN X23 carbon"
+   epc-device give windows "EWEADN X23 carbon" --no-guest-reset
+   epc-device status windows
+   Startup alternative: add --device-no-reset (applies to all selected USB devices).
+   Compare normal vs no-reset mode. This is not yet confirmed on physical Windows.
+6. Audio:
+   --voice-card passes isolated AMD HDA controller 0000:65:00.6 / Realtek ALC257
+   to Windows, including headphone/microphone ports. Host cannot use this card
+   while assigned. Select Realtek output in Windows. Check volume and jack sensing.
+   Release onboard PCI audio by stopping Windows; USB release does not detach PCI.
+   GPU HDMI/DP audio travels separately with --gpu.
+   USB sound cards (audio/HID only) use epc-device give/release as above.
+7. If frozen, collect evidence before terminating:
+   epc diagnose windows
+   epc-device status windows
+   epc stop windows --force
+   epc status windows
+   Wait for service cleanup before powering off Host. Direct writes cannot be undone.
+8. Performance check in the same game/scene: compare average FPS, 1% low and frame
+   time spikes with the previous build, alone and with Linux busy. No measured FPS
+   gain is claimed by the diskless simulation.
+
+The old epc-test guided flow still selects Windows trial; use these commands for
+this direct-mode resource/audio/receiver test. No RAM trial merge is performed.

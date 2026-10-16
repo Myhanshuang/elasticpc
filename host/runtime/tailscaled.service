@@ -1,0 +1,11 @@
+[Unit]
+Description=Tailscale for ElasticPC Host (independent identity)
+After=network.target
+[Service]
+Type=simple
+RuntimeDirectory=tailscale
+StateDirectory=tailscale
+ExecStart=/usr/local/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target

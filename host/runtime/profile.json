@@ -1,0 +1,67 @@
+{
+  "host_serial": "1C6F6530298EB360392A31E6",
+  "host_bytes": 15483273216,
+  "network": {
+    "name": "elasticpc",
+    "bridge": "epcbr0",
+    "subnet": "172.30.61.0/24",
+    "gateway": "172.30.61.1"
+  },
+  "windows": {
+    "disk": "/dev/disk/by-id/usb-Samsung_PSSD_T7_S5SYNJ0NC06429H-0:0",
+    "serial": "S5SYNJ0NC06429H",
+    "bytes": 1000204886016,
+    "ram_mib": 16384,
+    "vcpus": 8,
+    "mac": "52:54:00:ec:00:11",
+    "tap": "epcwin",
+    "vnc": 1,
+    "uuid": "ace1a43a-1021-4d17-a332-7cbbf537ebf1",
+    "vcpu_pins": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ]
+  },
+  "manjaro": {
+    "disk": "/dev/disk/by-id/nvme-YMTC_YMSS2ED08D25MC_YMB51T0JA242440G36",
+    "serial": "YMB51T0JA242440G36",
+    "bytes": 1024209543168,
+    "ram_mib": 10240,
+    "vcpus": 6,
+    "mac": "52:54:00:ec:00:12",
+    "tap": "epclin",
+    "vnc": 2,
+    "root_uuid": "1664a226-738f-48f5-93f9-bc62d700ac1e",
+    "uuid": "dac7f83d-e636-425b-a7cf-21fec5d6c895",
+    "vcpu_pins": [
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ]
+  },
+  "gpu": [
+    "0000:01:00.0",
+    "0000:01:00.1"
+  ],
+  "write_policy": "validated-drivers-installed-native",
+  "host_reserve_mib": 4096,
+  "io_cpus": [
+    0,
+    1
+  ],
+  "voice_card": {
+    "bdf": "0000:65:00.6",
+    "vendor": "0x1022",
+    "device": "0x15e3",
+    "name": "Realtek ALC257 Analog"
+  }
+}

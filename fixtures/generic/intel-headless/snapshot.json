@@ -1,0 +1,17 @@
+{
+  "provenance": "Synthetic Intel headless host without attached disks or displays.",
+  "architecture": "x86_64",
+  "files": {
+    "/proc/cpuinfo": "processor : 0\nflags : fpu vmx lm\n",
+    "/proc/meminfo": "MemTotal: 8388608 kB\nMemAvailable: 7340032 kB\n",
+    "/proc/self/mountinfo": "",
+    "/proc/swaps": "Filename Type Size Used Priority\n"
+  },
+  "commands": {
+    "lsblk": "{\"blockdevices\": []}"
+  },
+  "kvm_exists": true,
+  "kvm_accessible": false,
+  "iommu_groups_visible": false,
+  "secure_boot": null
+}

@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""Guided USB Host tests: Windows trial, explicitly approved Manjaro direct. Never powers off Host."""
+import argparse
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import runpy
+import select
+import shutil
+import subprocess
+import sys
+import time
+
+EPC = '/usr/local/bin/epc'
+BASE = Path('/var/lib/elasticpc/runtime')
+RUN = Path('/run/elasticpc')
+POLL = 150
+GUESTS = ('manjaro', 'windows')
+
+
+class Halt(Exception):
+    pass
+
+
+class Ops:
+    """Small injectable boundary; production has no simulation/guard bypass flag."""
+    def clock(self):
+        return time.monotonic()
+
+    def ask(self, text):
+        return input(text).strip()
+
+    def command(self, args, timeout=60, live=False):
+        try:
+            result = subprocess.run(args, text=True, capture_output=not live, timeout=timeout,
+                                    env={**os.environ, 'LC_ALL': 'C', 'SYSTEMD_PAGER': 'cat'})
+            return {'exit_code': result.returncode,
+                    'output': '' if live else (result.stdout + result.stderr)[-131072:]}
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            # Do not capture partial live output: it can contain login URLs/passwords.
+            return {'exit_code': -1, 'output': type(exc).__name__ + ': command unavailable or timed out'}
+
+    def wait(self, seconds):
+        deadline = self.clock() + seconds
+        print('Auto-check every 150 seconds. R + Enter: check now; Q + Enter: exit; Ctrl+C: interrupt.')
+        while self.clock() < deadline:
+            remaining = max(0, int(deadline - self.clock()))
+            print(f'\rNext check in about {remaining:3d} seconds...', end='', flush=True)
+            if select.select([sys.stdin], [], [], min(30, deadline - self.clock()))[0]:
+                line = sys.stdin.readline()
+                if not line:
+                    raise EOFError()
+                choice = line.strip().upper()
+                if choice == 'Q':
+                    raise Halt('User ended the wait')
+                if choice == 'R':
+                    print()
+                    return
+        print()
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def lock_free(name):
+    fd = os.open(RUN / (name + '.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+    finally:
+        os.close(fd)
+
+
+class TestRun:
+    def __init__(self, ops, epc, directory):
+        self.ops, self.epc, self.directory = ops, epc, directory
+        self.summary = {'version': 1, 'started_at': time.time(), 'status': 'incomplete',
+                        'stages': [], 'network': [], 'notes': [], 'safe_to_poweroff': False}
+        self.current = None
+        self.peer = None
+        self.lan = None
+        self.serial = 0
+        self.checkpoint()
+
+    def checkpoint(self):
+        temp = self.directory / 'summary.tmp'
+        temp.write_text(json.dumps(self.summary, ensure_ascii=False, indent=2) + '\n')
+        temp.replace(self.directory / 'summary.json')
+
+    def capture(self, label, args, timeout=60):
+        self.serial += 1
+        result = self.ops.command(args, timeout)
+        path = self.directory / f'{self.serial:03d}-{label}.json'
+        path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
+        return result
+
+    def live(self, args, timeout=60):
+        # Console/password and interactive authentication NEVER go through capture().
+        return self.ops.command(args, timeout, live=True)['exit_code'] == 0
+
+    def state(self, name):
+        state = read_json(BASE / (name + '-latest.json'))
+        if state:
+            session = Path(state.get('session', ''))
+            if session.parent != BASE or not any(session.name.startswith(name + '-' + mode + '-') for mode in (('trial', 'direct') if name == 'manjaro' else ('trial',))):
+                raise Halt('Latest session is not an expected Guest path; inspect it before starting a new Guest')
+        return state
+
+    def gate(self, name, expected=None, require_archive=False):
+        state = self.state(name)
+        result = self.ops.command(['systemctl', 'show', 'elasticpc-' + name,
+                                   '--property=ActiveState', '--value'])
+        service = result['output'].strip()
+        reasons = []
+        if result['exit_code'] or service not in ('inactive', 'failed'):
+            reasons.append('Service is still active or unknown: ' + (service or 'unknown'))
+        if not lock_free(name):
+            reasons.append('Guest lock is held')
+        if expected and state.get('session') != expected:
+            reasons.append('Session identity changed; refusing to control a different session')
+        session = Path(state['session']) if state else None
+        if session and (session / 'store').is_mount():
+            reasons.append('Trial store is still mounted (saving or unsaved)')
+        if state.get('status') == 'cleanup-failed':
+            reasons.append('Device/network cleanup failed; inspection required')
+        if require_archive and state.get('mode') != 'direct' and (state.get('archive') not in ('saved','discarded') or
+                                state.get('status') in ('starting', 'running', 'saving', 'save-failed')):
+            reasons.append('Trial archive is not confirmed saved')
+        if require_archive and state.get('mode') != 'direct' and session and state.get('storage') == 'ram' and state.get('archive') != 'discarded':
+            archive = read_json(session / 'archive.json')
+            saved = session / 'trial-saved.qcow2'
+            if (archive.get('status') != 'saved' or not saved.is_file() or saved.is_symlink()
+                    or archive.get('path') != str(saved)
+                    or archive.get('bytes') != saved.stat().st_size):
+                reasons.append('Archive metadata or saved overlay is missing/inconsistent')
+        if require_archive and state.get('archive') == 'discarded':
+            marker = read_json(session / 'archive.json') if session else {}
+            if state.get('status') != 'discarded' or not state.get('discard_requested') or marker.get('status') != 'discarded' or not marker.get('requested_by_user'):
+                reasons.append('Discard was not explicitly completed')
+        if require_archive and state.get('mode') == 'direct' and (state.get('status') != 'stopped' or state.get('exit_code') != 0 or (session / 'forced-stop.json').exists()):
+            reasons.append('Direct Guest did not shut down cleanly; inspect filesystem before native boot')
+        if session:
+            try:
+                self.epc['qmp'](session / 'qmp.sock', 'query-status')
+                reasons.append('QMP is still reachable')
+            except (OSError, ValueError, RuntimeError):
+                pass
+            pid = state.get('pid')
+            if pid:
+                try:
+                    args = (Path('/proc') / str(int(pid)) / 'cmdline').read_bytes().split(b'\0')
+                    if args and b'qemu-system' in args[0] and any(str(session / 'qmp.sock').encode() in x for x in args):
+                        reasons.append('This session QEMU process still exists')
+                except FileNotFoundError:
+                    pass
+                except (OSError, ValueError):
+                    reasons.append('Cannot confirm recorded QEMU process has ended')
+        return {'clear': not reasons, 'reasons': reasons, 'state': state, 'service': service}
+
+    def all_clear(self):
+        failures = []
+        for name in GUESTS:
+            failures.extend(name + ': ' + x for x in self.gate(name)['reasons'])
+        if any(path.is_mount() for path in BASE.glob('*/store')):
+            failures.append('A trial store is still mounted')
+        if failures:
+            raise Halt('\n'.join(failures))
+
+    def snapshot(self, label, name=None):
+        if name:
+            self.capture(label + '-diagnose', [EPC, 'diagnose', name], 30)
+            self.capture(label + '-status', [EPC, 'status', name], 30)
+            self.capture(label + '-journal', ['journalctl', '-b', '-u', 'elasticpc-' + name,
+                                             '--no-pager', '-n', '200'], 30)
+            state = self.state(name)
+            self.summary['stages'][-1]['latest_state'] = state
+            print('Guest state: ' + state.get('status', 'unknown') + '; archive: ' + state.get('archive', 'unknown'))
+            if state.get('status') == 'paused-space-limit':
+                print('RAM TRIAL FULL: Guest CPU is paused. VNC cannot respond. Choose F, then FORCE to stop and save.')
+        else:
+            self.capture(label, ['/usr/local/bin/epc-diagnostics', '--output',
+                                 str(self.directory / label)], 420)
+        self.checkpoint()
+
+    def prepare_network(self):
+        print('\nNetwork setup: use another device on the same tailnet for VNC. Login URLs/passwords are not logged.')
+        if self.ops.ask('Need Wi-Fi setup? Type WIFI to open settings; Enter to continue: ').upper() == 'WIFI':
+            self.live(['nmtui'], 600)
+        status = self.ops.command(['tailscale', 'ip', '-4'])
+        if status['exit_code'] or not status['output'].strip():
+            choice = self.ops.ask('Host has no Tailscale address. Type LOGIN to authenticate; anything else exits: ')
+            if choice.upper() != 'LOGIN':
+                raise Halt('Connect the Host network, then run epc-test again')
+            self.live(['tailscale', 'up', '--hostname=elasticpc-host', '--accept-routes=false'], 600)
+            status = self.ops.command(['tailscale', 'ip', '-4'])
+        try:
+            if status['exit_code'] or ipaddress.ip_address(status['output'].strip()) not in ipaddress.ip_network('100.64.0.0/10'):
+                raise ValueError()
+        except ValueError:
+            raise Halt('No Tailscale IPv4 address; finish nmtui / tailscale up, then run epc-test')
+        print('Host Tailscale IP: ' + status['output'].strip())
+        self.capture('wifi-devices', ['iw', 'dev'])
+        if shutil.which('iw'):
+            for item in Path('/sys/class/net').iterdir():
+                if (item / 'wireless').exists() or (item / 'phy80211').exists():
+                    self.capture('wifi-link-' + item.name, ['iw', 'dev', item.name, 'link'])
+                    self.capture('wifi-powersave-' + item.name, ['iw', 'dev', item.name, 'get', 'power_save'])
+        choice = self.ops.ask('Keep phone awake and online. Peer IP [100.98.237.96], other IP, or S to skip: ')
+        if choice.upper() == 'S':
+            self.summary['notes'].append('User skipped network comparison')
+            return
+        self.peer = self.valid_ip(choice or '100.98.237.96')
+        choice = self.ops.ask('Same phone LAN IP [192.168.31.211], other IP, or S to omit LAN comparison: ')
+        self.lan = None if choice.upper() == 'S' else self.valid_ip(choice or '192.168.31.211')
+        self.network('idle')
+
+    @staticmethod
+    def valid_ip(value):
+        address = ipaddress.ip_address(value)
+        if address.is_unspecified or address.is_multicast or address.is_loopback or str(address) == '255.255.255.255':
+            raise Halt('Enter a valid unicast device IP address')
+        return str(address)
+
+    def network(self, label):
+        if not self.peer:
+            print('Network tests were skipped for this run.')
+            return
+        print('Sampling 30 pings: gateway, phone LAN, and tailnet. About one minute.')
+        args = ['/usr/local/bin/epc-network-check', self.peer, '--samples', '30']
+        if self.lan:
+            args += ['--lan-peer', self.lan]
+        result = self.capture('network-' + label, args, 180)
+        print(result['output'])
+        self.summary['network'].append({'label': label, **result})
+        self.checkpoint()
+
+    def still_ours(self, name, session):
+        if self.state(name).get('session') != session:
+            raise Halt('Session changed; refusing to control another session')
+
+    def start(self, name, gpu):
+        self.all_clear()
+        old = self.state(name).get('session')
+        previous_error = read_json(BASE / (name + '-last-error.json'))
+        stage = {'guest': name, 'gpu': gpu, 'human_result': 'not_observed',
+                 'automated_qmp_ready': False, 'archive_gate_passed': False}
+        self.summary['stages'].append(stage)
+        self.current = name
+        mode = 'direct' if name == 'manjaro' else 'trial'
+        stage['mode'] = mode
+        args = [EPC, 'start', name, '--mode', mode] + (['--gpu'] if gpu else [])
+        result = self.capture(name + '-start', args, 90)
+        print(result['output'])
+        if result['exit_code']:
+            raise Halt(name + ' start request failed; preserving evidence and stopping this workflow')
+        deadline = self.ops.clock() + 600
+        while True:
+            result = self.capture(name + '-startup', [EPC, 'status', name], 30)
+            state = self.state(name)
+            error = read_json(BASE / (name + '-last-error.json'))
+            if error and error != previous_error:
+                stage['startup_error'] = error
+                if state.get('session') and state['session'] != old:
+                    stage['session'] = state['session']
+                self.checkpoint()
+                raise Halt(name + ' startup preflight failed: ' + str(error.get('error', error)))
+            if state.get('session') and state['session'] != old:
+                stage['session'] = state['session']
+                stage['latest_state'] = state
+                try:
+                    live = json.loads(result['output'])
+                except ValueError:
+                    live = {}
+                if state.get('status') == 'running' and isinstance(live.get('qmp'), dict) and live['qmp'].get('status') == 'running':
+                    stage['automated_qmp_ready'] = True
+                    self.checkpoint()
+                    return stage
+                if state.get('status') in ('failed', 'save-failed', 'cleanup-failed', 'io-error', 'guest-panicked', 'paused-space-limit', 'stopped', 'forced-stopped'):
+                    stage['human_result'] = 'startup_failed'
+                    print('Startup problem: ' + state.get('status', 'unknown'))
+                    return stage
+            print(result['output'][-3000:])
+            service = self.ops.command(['systemctl', 'show', 'elasticpc-' + name, '--property=ActiveState', '--value'])
+            if service['exit_code'] == 0 and service['output'].strip() in ('inactive', 'failed') and state.get('session') == old:
+                raise Halt(name + ' exited without a new session; inspect this run service logs')
+            if self.ops.clock() >= deadline:
+                raise Halt('Startup preparation exceeded 10 minutes; no forced stop issued. Follow recovery instructions')
+            self.ops.wait(POLL)
+
+    def observe(self, name, stage):
+        if not stage['automated_qmp_ready']:
+            return
+        print('\nQMP is ready. This does NOT prove OS/desktop boot. Open the console URL below.')
+        results = [self.live([EPC, 'console', name]), self.live([EPC, 'password', name]),
+                   self.live([EPC, 'console', name])]
+        stage['console_commands_ok'] = all(results)
+        print('Console repeat/password retrieval commands succeeded. Password shown only on this terminal.' if all(results)
+              else 'Console/password command failed. This item remains failed even if desktop works.')
+        print('Check desktop, ordinary apps, and Internet. If stuck spinning for ~5 minutes, select D for diagnostics.')
+        while True:
+            answer = self.ops.ask('\nP=desktop/apps/network PASS F=FAIL D=diagnose C=console W=password N=network R=hard-reset Q=exit: ').upper()
+            if answer in ('P', 'F'):
+                stage['human_result'] = 'passed' if answer == 'P' else 'failed'
+                stage['human_note'] = self.ops.ask('Boot time / blue-screen code / issue (NO passwords; Enter to skip): ')[:2000]
+                self.checkpoint()
+                return
+            if answer == 'Q':
+                raise Halt('User ended testing')
+            self.still_ours(name, stage['session'])
+            if answer == 'D':
+                self.snapshot(name + '-manual', name)
+            elif answer in ('C', 'W'):
+                self.live([EPC, 'console' if answer == 'C' else 'password', name])
+            elif answer == 'N':
+                self.network(name + ('-gpu' if stage['gpu'] else ''))
+            elif answer == 'R':
+                self.snapshot(name + '-before-reset', name)
+                if self.ops.ask('Hard reset may lose unsaved Guest data. Type RESET to reset this Guest: ') == 'RESET':
+                    result = self.capture(name + '-reset', [EPC, 'restart', name, '--force'], 30)
+                    print(result['output'])
+                    stage['forced_reset_requested'] = result['exit_code'] == 0
+
+    def stop_and_save(self, name, stage):
+        session = stage.get('session')
+        if not session:
+            raise Halt('No new session identity; cannot safely send stop commands')
+        self.still_ours(name, session)
+        self.snapshot(name + '-before-stop', name)
+        initial = self.gate(name, session)
+        if initial['clear'] and initial['state'].get('mode') != 'direct' and not initial['state'].get('archive'):
+            raise Halt('Startup failed before trial storage existed. Diagnostics saved; stopping this workflow')
+        print('\nRequesting normal Guest shutdown. Windows RAM trial is then archived; Manjaro direct has no archive. Do NOT unplug USB or power off Host.')
+        discard = initial['state'].get('mode') == 'trial' and self.ops.ask('Enter=normal stop and SAVE; DISCARD=force stop and throw away all trial changes: ') == 'DISCARD'
+        args = [EPC, 'stop', name] + (['--force','--discard'] if discard else [])
+        result = self.capture(name + '-stop', args, 30)
+        stage['discard_requested'] = discard and result['exit_code'] == 0
+        print(result['output'])
+        deadline = self.ops.clock() + 1800
+        while True:
+            self.still_ours(name, session)
+            gate = self.gate(name, session, require_archive=True)
+            stage['final_gate'] = gate
+            self.checkpoint()
+            if gate['clear']:
+                self.all_clear()
+                stage['archive_gate_passed'] = True
+                self.current = None
+                self.checkpoint()
+                stage['discarded'] = gate['state'].get('archive') == 'discarded'
+                print(name + ': stopped; ' + ('trial DISCARDED' if stage['discarded'] else 'storage finalized') + '; locks and mounts released.')
+                return
+            state = gate['state']
+            print('State: ' + state.get('status', 'unknown') + '; archive: ' + state.get('archive', 'unknown'))
+            if state.get('status') == 'saving':
+                print('GUEST IS OFF. Saving RAM changes to USB; do not hold the power button.')
+                if self.ops.ask('Enter=keep saving; DISCARD=cancel save and throw away this trial: ') == 'DISCARD':
+                    result = self.capture(name + '-discard', [EPC,'stop',name,'--force','--discard'],30)
+                    stage['discard_requested'] = result['exit_code'] == 0
+                    print(result['output'])
+                progress = self.epc.get('archive_progress', lambda path: None)(Path(session))
+                if progress:
+                    stage['archive_progress'] = progress
+                    print('Archive phase: {phase}; copied {copied_bytes}/{total_bytes} bytes; verified {verified_bytes}; elapsed {elapsed_seconds}s'.format(**progress))
+                    if progress['phase'] == 'flushing':
+                        print('Waiting for USB to persist writes. Copying is done; saving is NOT done yet.')
+            print('; '.join(gate['reasons']))
+            if state.get('mode') == 'direct' and gate['service'] in ('inactive', 'failed') and not gate['clear']:
+                raise Halt('Direct Guest stopped abnormally; preserve evidence and check filesystem before native boot')
+            if state.get('status') == 'cleanup-failed':
+                raise Halt('Cleanup failed; stopping further tests. Inspect GPU/network restoration')
+            if self.ops.clock() >= deadline:
+                raise Halt('Shutdown/archive exceeded 30 minutes; workflow stopped, no automatic kill')
+            if state.get('archive') == 'failed' and gate['service'] in ('inactive', 'failed') and lock_free(name):
+                if self.ops.ask('Archive failed; RAM copy may remain. Type SAVE to retry archive; anything else exits: ') != 'SAVE':
+                    raise Halt('Archive is not complete')
+                result = self.capture(name + '-save', [EPC, 'save', name], 1800)
+                print(result['output'])
+            elif gate['service'] not in ('inactive', 'failed') and state.get('status') != 'saving':
+                choice = self.ops.ask('Waiting for shutdown. Enter to wait; FORCE to power off this Guest (unsaved data may be lost): ')
+                if choice == 'FORCE':
+                    result = self.capture(name + '-force-stop', [EPC, 'stop', name, '--force'], 30)
+                    print(result['output'])
+                    stage['forced_stop_requested'] = result['exit_code'] == 0
+            self.ops.wait(POLL)
+
+    def run(self):
+        print('ElasticPC guided tests: Manjaro direct -> Windows RAM trial WITH GPU passthrough.')
+        print('Windows: RAM trial. Manjaro: DIRECT native disk writes (user authorized). Sequential guided tests; runtime permits concurrent Guests within the memory budget. No Host shutdown.')
+        self.all_clear()
+        self.snapshot('host-baseline')
+        self.prepare_network()
+        for name in GUESTS:
+            print('\nStarting ' + name + (' DIRECT (writes original disk)' if name == 'manjaro' else ' RAM trial') + (' WITH NVIDIA GPU passthrough.' if name == 'windows' else ' without GPU passthrough.'))
+            if self.ops.ask('Enter to continue; Q to exit: ').upper() == 'Q':
+                raise Halt('User ended testing')
+            if name == 'windows':print('Connect NVIDIA external display. Keep AMD Host display or remote terminal available.')
+            stage = self.start(name, name == 'windows')
+            self.observe(name, stage)
+            self.stop_and_save(name, stage)
+        self.summary['notes'].append('Windows GPU passthrough requested after Manjaro; human display/device validation required')
+        self.snapshot('host-final')
+        self.all_clear()
+        self.summary['safe_to_poweroff'] = all(s['archive_gate_passed'] for s in self.summary['stages'])
+        passed = all(s['human_result'] == 'passed' and s.get('console_commands_ok')
+                     and not s.get('discarded') for s in self.summary['stages'])
+        self.summary['status'] = 'completed' if passed else 'completed_with_failures'
+        self.summary['native_manjaro_boot_verified'] = False
+        self.summary['finished_at'] = time.time()
+        self.checkpoint()
+        print('\nWorkflow complete. Observations: ' + ('tested stages passed' if passed else 'failures recorded; diagnostics retained'))
+        print('Guests stopped; Windows trial saved or explicitly discarded. Run sync then poweroff manually. Remove USB and boot native Manjaro; verify login, files and clean shutdown. Native fallback remains unverified until you report it.')
+
+    def interrupted(self, reason):
+        self.summary['status'] = 'incomplete'
+        self.summary['interruption'] = str(reason)
+        if self.current:
+            try:
+                self.snapshot(self.current + '-interrupted', self.current)
+            except Exception:
+                pass
+        self.checkpoint()
+        print('\nTesting incomplete: ' + str(reason))
+        print('No automatic forced shutdown. Do NOT cut power. Inspect these states first:')
+        for name in GUESTS:
+            print(f'  epc status {name}')
+            print(f'  cat {BASE}/{name}-latest.json')
+        if self.current:
+            print(f'Current target: epc stop {self.current}; only if stuck: epc stop {self.current} --force')
+            print(f'After service ended, if archive failed: epc save {self.current}')
+        print('Power off Host only after all Guest services ended, archive:saved, and trial stores unmounted.')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args(argv)
+    if os.geteuid() != 0:
+        raise Halt('Log into the USB Host as root, then run epc-test')
+    epc = runpy.run_path(EPC, run_name='epc_test_library')
+    epc['host_guard'](json.loads(epc['CONF'].read_text()))
+    os.umask(0o077)
+    RUN.mkdir(exist_ok=True)
+    with (RUN / 'guided-test.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Halt('Another epc-test is running; return to that terminal')
+        directory = Path('/root/epc-tests') / time.strftime('%Y%m%d-%H%M%S')
+        directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+        test = TestRun(Ops(), epc, directory)
+        try:
+            test.run()
+            return 0 if test.summary['status'] == 'completed' else 1
+        except (Exception, KeyboardInterrupt) as exc:
+            test.interrupted(str(exc) or 'Terminal interrupted / Ctrl+C')
+            return 1
+        finally:
+            print('Report: ' + str(directory / 'summary.json'))
+            print('Diagnostics may include local addresses and screen contents; keep them private.')
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (Halt, OSError, ValueError, RuntimeError) as error:
+        print('Cannot start testing: ' + str(error), file=sys.stderr)
+        sys.exit(1)

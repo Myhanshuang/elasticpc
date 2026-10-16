@@ -1,0 +1,19 @@
+[workspace]
+members = ["crates/elastic-core", "crates/elastic-probe", "crates/elastic-planner", "crates/elastic-state", "crates/elastic-controller", "crates/elastic-lab", "crates/elastic-virt-libvirt", "crates/elasticctl"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tracing = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+tempfile = "3.27"
+libc = "0.2"

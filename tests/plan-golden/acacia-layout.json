@@ -1,0 +1,119 @@
+{
+  "affected_devices": [
+    {
+      "id": "/dev/disk/by-id/nvme-YMTC_REDACTED",
+      "kind": "block_disk"
+    },
+    {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "kind": "block_partition"
+    },
+    {
+      "id": "11111111-1111-1111-1111-111111111113",
+      "kind": "block_partition"
+    }
+  ],
+  "capability_gaps": [
+    "Exact sector ranges, filesystem shrink feasibility, Host image/EFI footprint and recovery rehearsal are not yet measured",
+    "Physical partition, filesystem and UEFI mutation is outside P0/P1; no executor is provided"
+  ],
+  "id": "plan-6fc6a8ab1ef1132ee52c1976c330b43d2efe9bdea66437e342570187d9b62606",
+  "installation_id": null,
+  "kind": "host_layout_alternatives",
+  "operations": [
+    {
+      "action": "alternative_b_offline_shrink",
+      "description": "Conditional Plan B: if full swap must remain, inventory services on PARTUUID 11111111-1111-1111-1111-111111111111, migrate/clean data, check filesystem offline, shrink ext4 first, then reduce its GPT extent without changing its starting sector and reserve aligned Host space",
+      "writes_source": true
+    },
+    {
+      "action": "alternative_a_repurpose_swap",
+      "description": "Conditional Plan A: after user accepts reduced/removed disk swap and no hibernation requirement is proven, repartition approved PARTUUID 11111111-1111-1111-1111-111111111113 space for a 21474836480-byte Host root plus feasible retained swap",
+      "writes_source": true
+    },
+    {
+      "action": "alternative_a_update_resume",
+      "description": "Conditional Plan A: update Manjaro fstab, all resume references and initramfs consistently; verify native boot and hibernation policy from recovery media",
+      "writes_source": true
+    },
+    {
+      "action": "preserve_native_efi",
+      "description": "After one layout alternative is approved, use a separate \\EFI\\ElasticPC\\ directory and independent boot entry; preserve all existing Windows/Manjaro entries and files, including entries absent from BootOrder",
+      "writes_source": true
+    }
+  ],
+  "preconditions": [
+    {
+      "code": "observation_schema",
+      "detail": "Observation schema 1; planner supports 1",
+      "status": "satisfied"
+    },
+    {
+      "code": "requested_host_size",
+      "detail": "Requested Host root capacity: 21474836480 bytes; final image, swap, alignment and EFI overhead require separate measurement",
+      "status": "satisfied"
+    },
+    {
+      "code": "layout_is_not_filesystem_free_space",
+      "detail": "Filesystem free space (including df output) is not unallocated GPT space; only a verified sector layout can admit a new partition",
+      "status": "satisfied"
+    },
+    {
+      "code": "independent_recovery",
+      "detail": "Verify independent full data backup, GPT/ESP backups, a Live recovery medium, and native Windows/Manjaro boot before any physical change",
+      "status": "needs_verification"
+    },
+    {
+      "code": "explicit_layout_choice",
+      "detail": "Choose exactly one mutually exclusive layout alternative and approve its final sector ranges; this combined review plan cannot be applied",
+      "status": "needs_verification"
+    },
+    {
+      "code": "gpt_sector_layout",
+      "detail": "For /dev/disk/by-id/nvme-YMTC_REDACTED, verify GPT GUID, logical sector size, exact start/end sectors, alignment and contiguous free extents",
+      "status": "needs_verification"
+    },
+    {
+      "code": "unallocated_capacity",
+      "detail": "For /dev/disk/by-id/nvme-YMTC_REDACTED, unallocated capacity is unknown; no capacity is inferred from filesystem free space or rounded partition sizes",
+      "status": "needs_verification"
+    },
+    {
+      "code": "alternative_b_offline_ext4",
+      "detail": "PARTUUID 11111111-1111-1111-1111-111111111111: shrink ext4 only from a Live/offline environment while unmounted; perform filesystem checks and measure minimum size plus operating headroom",
+      "status": "blocked"
+    },
+    {
+      "code": "alternative_b_capacity",
+      "detail": "Measure real ext4 used/minimum size, metadata and future operating headroom; clean/transfer data before approving exact filesystem and partition sizes",
+      "status": "needs_verification"
+    },
+    {
+      "code": "alternative_a_swap_capacity",
+      "detail": "PARTUUID 11111111-1111-1111-1111-111111111113: swap region is 30386893619 bytes; Host root needs 21474836480 bytes before alignment and any retained swap",
+      "status": "satisfied"
+    },
+    {
+      "code": "alternative_a_resume",
+      "detail": "Check fstab, current and configured kernel resume/resume_offset arguments, initramfs, bootloader profiles and hibernation use; absence from the current command line alone is insufficient",
+      "status": "needs_verification"
+    },
+    {
+      "code": "alternative_a_swap_inactive",
+      "detail": "PARTUUID 11111111-1111-1111-1111-111111111113 must be inactive and unheld in the approved offline environment; revalidate swap state before editing",
+      "status": "blocked"
+    },
+    {
+      "code": "efi_capacity",
+      "detail": "Measure actual Host boot-file requirements and ESP free bytes; a nominal ESP size cannot prove capacity, and a separate Host ESP may be necessary",
+      "status": "needs_verification"
+    }
+  ],
+  "requires_approval": true,
+  "rollback": [
+    "Use the verified recovery medium and independent backups; restoring GPT alone does not restore an already-shrunk or overwritten filesystem",
+    "Restore approved filesystem/data and boot metadata together with the matching partition map; verify both native operating systems independently",
+    "Remove only ElasticPC-owned files/entry after verification; preserve original native boot entries and default order"
+  ],
+  "schema_version": 1
+}

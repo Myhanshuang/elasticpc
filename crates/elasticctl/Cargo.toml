@@ -1,0 +1,23 @@
+[package]
+name = "elasticctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+native-libvirt = ["elastic-virt-libvirt/native-libvirt", "elastic-controller/native-libvirt"]
+
+[dependencies]
+elastic-core = { path = "../elastic-core" }
+elastic-probe = { path = "../elastic-probe" }
+elastic-planner = { path = "../elastic-planner" }
+elastic-controller = { path = "../elastic-controller" }
+elastic-lab = { path = "../elastic-lab" }
+elastic-virt-libvirt = { path = "../elastic-virt-libvirt" }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "elastic-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+elastic-core = { path = "../elastic-core" }
+elastic-planner = { path = "../elastic-planner" }
+libc.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

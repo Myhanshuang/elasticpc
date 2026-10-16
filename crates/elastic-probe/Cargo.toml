@@ -1,0 +1,16 @@
+[package]
+name = "elastic-probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+elastic-core = { path = "../elastic-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lib]
+path = "src/lib.rs"

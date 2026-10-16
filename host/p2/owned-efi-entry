@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+"""Print the single owned lab entry; reject ambiguous labels or foreign paths."""
+import re
+import sys
+
+matches = []
+for line in sys.stdin:
+    label, _, device_path = line.rstrip('\n').partition('\t')
+    match = re.fullmatch(r'Boot([0-9A-Fa-f]{4})\*? ElasticPC', label)
+    if match:
+        matches.append((match.group(1), device_path))
+if len(matches) != 1 or not matches[0][1].lower().endswith(r'/file(\efi\elasticpc\shimx64.efi)'):
+    sys.exit('Expected exactly one ElasticPC entry with its owned EFI path')
+print(matches[0][0])

@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Bounded, read-only network probes; observing direct is not a stability test."""
+import argparse
+import concurrent.futures
+import ipaddress
+import json
+import math
+import os
+from pathlib import Path
+import re
+import statistics
+import subprocess
+import time
+
+REPORT_DIR = Path('/var/lib/elasticpc')
+NO_REPLY_NOTE = ('No ICMP replies alone do not prove the peer is unreachable; '
+                 'phone sleep, firewall policy, or ICMP handling can suppress replies.')
+
+
+def unicast_ip(value):
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('Expected a unicast IPv4 or IPv6 address') from exc
+    if address.is_multicast or address.is_unspecified or str(address) == '255.255.255.255':
+        raise argparse.ArgumentTypeError('Multicast, broadcast and unspecified addresses are refused')
+    return str(address)
+
+
+def peer_name(value):
+    if not value or value.startswith('-') or any(c.isspace() for c in value):
+        raise argparse.ArgumentTypeError('Invalid peer hostname or address')
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', value):
+            raise argparse.ArgumentTypeError('Invalid peer hostname or address')
+        return value
+    return unicast_ip(value)
+
+
+def sample_count(value):
+    count = int(value)
+    if not 10 <= count <= 120:
+        raise argparse.ArgumentTypeError('--samples must be between 10 and 120')
+    return count
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument('peer', type=peer_name, help='An online Tailscale peer hostname or IP')
+    result.add_argument('--lan-peer', type=unicast_ip,
+                        help='Optional LAN IP of the SAME peer for a Wi-Fi comparison')
+    result.add_argument('--guest-peer', type=unicast_ip, help='Guest bridge IP; probe virtual network simultaneously')
+    result.add_argument('--samples', type=sample_count, default=30,
+                        help='Ordinary ICMP probes per target, one per second (10..120; default 30)')
+    return result
+
+
+def run_command(args, timeout):
+    result = {'command': args, 'started_at': time.time()}
+    try:
+        completed = subprocess.run(args, text=True, capture_output=True, timeout=timeout,
+                                   env={**os.environ, 'LC_ALL': 'C'})
+        result.update(exit_code=completed.returncode, output=completed.stdout + completed.stderr)
+    except subprocess.TimeoutExpired as exc:
+        def text(value):
+            return value.decode(errors='replace') if isinstance(value, bytes) else value or ''
+        result.update(error='timeout', output=text(exc.stdout) + text(exc.stderr))
+    except OSError as exc:
+        result.update(error=str(exc), output='')
+    result['finished_at'] = time.time()
+    return result
+
+
+def local_snapshot():
+    uname = os.uname()
+    result = {'hostname': uname.nodename, 'system': uname.sysname,
+              'kernel': uname.release, 'machine': uname.machine, 'pressure': {}}
+    for name in ('cpu', 'io', 'memory'):
+        try:
+            result['pressure'][name] = (Path('/proc/pressure') / name).read_text().strip()
+        except OSError:
+            result['pressure'][name] = None
+    return result
+
+
+def selected_peer_status(peer):
+    # Keep the rest of the tailnet out of the report; no credentials are read.
+    result = run_command(['tailscale', 'status', '--json'], 5)
+    if result.get('exit_code') != 0:
+        return {'available': False, 'reason': 'tailscale status unavailable'}
+    try:
+        peers = json.loads(result['output']).get('Peer', {}) or {}
+        for row in peers.values():
+            names = {str(row.get(key, '')).rstrip('.').lower() for key in ('HostName', 'DNSName')}
+            if peer in (row.get('TailscaleIPs') or []) or peer.rstrip('.').lower() in names:
+                return {'available': True, **{key: row.get(key) for key in ('Online', 'LastSeen', 'CurAddr', 'Relay')},
+                        'note': 'Status is a snapshot; Relay alone does not prove the current data path.'}
+    except (ValueError, TypeError, AttributeError):
+        return {'available': False, 'reason': 'Unable to parse selected peer status'}
+    return {'available': False, 'reason': 'Peer not found by exact IP or hostname'}
+
+
+def icmp_stats(output):
+    """Keep absent evidence distinct from measured 100% packet loss."""
+    summary = re.search(r'(\d+) packets transmitted,\s*(\d+) (?:packets )?received,.*?'
+                        r'([\d.]+)% packet loss', output)
+    transmitted, received, loss = (int(summary[1]), int(summary[2]), float(summary[3])) if summary else (None, None, None)
+    samples = {}
+    upper_bounds = 0
+    for line in output.splitlines():
+        match = re.search(r'icmp_seq=(\d+).*?time([=<])([\d.]+)\s*ms', line)
+        if match and match[1] not in samples:
+            samples[match[1]] = float(match[3])
+            upper_bounds += match[2] == '<'
+    values = sorted(samples.values())
+    rtt = {key: None for key in ('min', 'avg', 'p95', 'p99', 'max', 'mdev')}
+    if values:
+        rtt.update(min=min(values), avg=statistics.mean(values),
+                   p95=values[math.ceil(len(values) * .95) - 1], p99=values[math.ceil(len(values) * .99) - 1], max=max(values),
+                   mdev=statistics.pstdev(values))
+    aggregate = re.search(r'(?:rtt|round-trip) min/avg/max/(?:mdev|stddev) = '
+                          r'([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms', output)
+    if aggregate:
+        rtt.update(zip(('min', 'avg', 'max', 'mdev'), map(float, aggregate.groups())))
+    return {'transmitted': transmitted, 'received': received,
+            'packet_loss_percent': loss, 'latency_samples_received': len(values),
+            'rtt_ms': rtt, 'p95_method': 'nearest-rank of nonduplicate replies',
+            'upper_bound_samples': upper_bounds, 'summary_complete': summary is not None,
+            'note': NO_REPLY_NOTE if not values else
+                    'ICMP includes endpoint scheduling and Wi-Fi; it does not measure throughput.'}
+
+
+def path_observations(output):
+    observations = []
+    for line in output.splitlines():
+        match = re.search(r'pong from .+ via (.+) in ([\d.]+)ms', line)
+        if not match:
+            continue
+        endpoint = match[1]
+        lower = endpoint.lower()
+        if 'derp' in lower:
+            kind = 'derp'
+        elif 'peer-relay' in lower or 'peer relay' in lower:
+            kind = 'peer-relay'
+        elif re.fullmatch(r'(?:\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:%._-]+\]):\d+', endpoint):
+            kind = 'direct'
+        else:
+            kind = 'unknown'
+        observations.append({'kind': kind, 'endpoint': endpoint, 'rtt_ms': float(match[2])})
+    return {'observations': observations,
+            'direct_observed': any(x['kind'] == 'direct' for x in observations),
+            'reply_count': len(observations),
+            'note': 'A direct reply only proves a direct path was observed during this sample; '
+                    'it does not establish stable latency or no packet loss.'}
+
+
+def default_gateway(route_results):
+    for name in ('routes', 'routes6'):
+        result = route_results[name]
+        if result.get('exit_code') != 0:
+            continue
+        try:
+            routes = json.loads(result['output'])
+            candidates = sorted((r for r in routes if r.get('dst') == 'default' and r.get('gateway')),
+                                key=lambda r: int(r.get('metric', 0)))
+            for route in candidates:
+                address = unicast_ip(route['gateway'])
+                parsed = ipaddress.ip_address(address)
+                if parsed.version == 6 and parsed.is_link_local:
+                    if not route.get('dev'):
+                        continue
+                    address += '%' + route['dev']
+                return address
+        except (ValueError, TypeError, argparse.ArgumentTypeError):
+            continue
+    return None
+
+
+def collect(peer, samples, lan_peer=None, guest_peer=None):
+    report = {'time': time.time(), 'peer': peer, 'lan_peer': lan_peer, 'samples': samples,
+              'guest_peer': guest_peer, 'sample_interval_seconds': 1, 'direct_verified': False, 'tests': {},
+              'local_before': local_snapshot()}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        peer_before = pool.submit(selected_peer_status, peer)
+        routes = {name: pool.submit(run_command, args, 5) for name, args in (
+            ('routes', ['ip', '-j', 'route']), ('routes6', ['ip', '-j', '-6', 'route']))}
+        report['tests'].update((name, future.result()) for name, future in routes.items())
+        gateway = default_gateway(report['tests'])
+        report['gateway'] = gateway
+        jobs = {
+            'netcheck': (['tailscale', 'netcheck'], 45),
+            # Verified in installed CLI help; the default stops at the first direct reply.
+            'path': (['tailscale', 'ping', '--until-direct=false', '--c=' + str(min(samples, 30)),
+                      '--timeout=1s', peer], 45),
+        }
+        targets = {'icmp': peer}
+        if gateway:
+            targets['gateway_icmp'] = gateway
+        else:
+            report['tests']['gateway_icmp'] = {'error': 'No default gateway found; comparison unavailable'}
+        if lan_peer:
+            targets['lan_icmp'] = lan_peer
+        if guest_peer:
+            targets['guest_icmp'] = guest_peer
+        for name, target in targets.items():
+            jobs[name] = (['ping', '-n', '-D', '-i', '1', '-c', str(samples), '-W', '2',
+                           '-w', str(samples + 5), '--', target], samples + 10)
+        futures = {name: pool.submit(run_command, *job) for name, job in jobs.items()}
+        report['tests'].update((name, future.result()) for name, future in futures.items())
+        report['peer_before'] = peer_before.result()
+    report['peer_after'] = selected_peer_status(peer)
+    report['local_after'] = local_snapshot()
+    for name in targets:
+        report['tests'][name]['statistics'] = icmp_stats(report['tests'][name].get('output', ''))
+    report['path_observations'] = path_observations(report['tests']['path'].get('output', ''))
+    report['direct_observed'] = report['path_observations']['direct_observed']
+    report['direct_verified'] = report['direct_observed']
+    report['direct_verified_meaning'] = 'Compatibility alias for direct_observed, NOT a stability verdict'
+    report['limitations'] = [NO_REPLY_NOTE,
+                            'Gateway ICMP may be deprioritized; compare with the same peer LAN and tailnet paths.',
+                            'Path observations may not cover the entire ICMP test.',
+                            'No network settings changed; no bandwidth or throughput test performed.']
+    report['finished_at'] = time.time()
+    return report
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    report = collect(args.peer, args.samples, args.lan_peer, args.guest_peer)
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    out = REPORT_DIR / ('network-check-' + str(time.time_ns()) + '.json')
+    with os.fdopen(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as stream:
+        json.dump(report, stream, indent=2)
+        stream.write('\n')
+    print(json.dumps({'report': str(out), 'direct_verified': report['direct_verified'],
+                      'direct_observed': report['direct_observed'],
+                      'icmp': {name: value['statistics'] for name, value in report['tests'].items()
+                               if 'statistics' in value},
+                      'note': report['direct_verified_meaning'] + '. ' + NO_REPLY_NOTE}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

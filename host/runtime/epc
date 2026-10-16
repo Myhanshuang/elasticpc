@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""Explicit physical-Host session runner. Never auto-starts native-backed Guests."""
+import runpy
+import argparse,secrets,fcntl,hashlib,ipaddress,json,re,os,shutil,socket,stat,subprocess,sys,time,uuid,signal
+from pathlib import Path
+BASE=Path('/var/lib/elasticpc/runtime');CONF=Path('/etc/elasticpc/runtime.json');RUN=Path('/run/elasticpc')
+
+def run(args,**kw):
+ result=subprocess.run([str(x) for x in args],text=True,capture_output=True,env={**os.environ,'LC_ALL':'C'},timeout=kw.pop('timeout',60),**kw)
+ if result.returncode:raise RuntimeError(str(args[0])+': '+(result.stderr or result.stdout).strip()[-4000:])
+ return result.stdout
+
+def atomic(path,value):
+ path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_suffix('.tmp')
+ with tmp.open('w') as f:json.dump(value,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+ tmp.replace(path);fd=os.open(path.parent,os.O_RDONLY);os.fsync(fd);os.close(fd)
+
+def flat(rows):
+ for row in rows:
+  yield row
+  yield from flat(row.get('children',[]))
+
+def disk_info(path):
+ return json.loads(run(['lsblk','-J','-b','-p','-o','PATH,SERIAL,SIZE,MAJ:MIN,MOUNTPOINTS',path]))['blockdevices']
+
+def host_guard(cfg):
+ if os.geteuid()!=0:raise RuntimeError('Run inside the USB Host as root')
+ rootdev=run(['findmnt','-n','-o','SOURCE','/']).strip()
+ ancestors=json.loads(run(['lsblk','-J','-s','-b','-o','SERIAL,SIZE',rootdev]))['blockdevices']
+ if not any(x.get('serial')==cfg['host_serial'] and int(x['size'])==cfg['host_bytes'] for x in flat(ancestors)):
+  raise RuntimeError('Refuse: current / is not the approved USB Host')
+ if not Path('/etc/elasticpc/runtime-enabled').exists():raise RuntimeError('Missing installed Host marker')
+
+def source_guard(p):
+ rows=disk_info(p['disk']);r=rows[0]
+ if r.get('serial')!=p['serial'] or int(r['size'])!=p['bytes']:raise RuntimeError('Source disk identity changed')
+ nodes=list(flat(rows));devnums={x['maj:min'] for x in nodes}
+ if any(any(x.get('mountpoints',[])) for x in nodes):raise RuntimeError('Source or child partition is mounted')
+ for proc in Path('/proc').iterdir():
+  if not proc.name.isdigit():continue
+  try:
+   for line in (proc/'mountinfo').read_text().splitlines():
+    if line.split()[2] in devnums:raise RuntimeError('Source mounted in a process namespace')
+  except FileNotFoundError:pass
+  except PermissionError:raise RuntimeError('Cannot establish global mount ownership')
+  except OSError as e:
+   if e.errno==22 and not (proc/'ns/mnt').exists():continue
+   raise
+ for line in Path('/proc/swaps').read_text().splitlines()[1:]:
+  path=line.split()[0];s=os.stat(path)
+  number=f'{os.major(s.st_rdev if stat.S_ISBLK(s.st_mode) else s.st_dev)}:{os.minor(s.st_rdev if stat.S_ISBLK(s.st_mode) else s.st_dev)}'
+  if number in devnums:raise RuntimeError('Source contains active swap')
+ for x in nodes:
+  k=Path(x['path']).name
+  if list((Path('/sys/class/block')/k/'holders').iterdir()):raise RuntimeError('Source has active device-mapper/RAID holders')
+  r=subprocess.run(['fuser',x['path']],capture_output=True)
+  if r.returncode==0:raise RuntimeError('Source has open users')
+  if r.returncode!=1:raise RuntimeError('Unable to establish source ownership')
+ return r
+
+def windows_clean(volume):
+ metadata=run(['ntfsinfo','-m',volume])
+ match=re.search(r'Volume Flags:\s*(0x[0-9a-fA-F]+)',metadata)
+ if not match or int(match.group(1),16)!=0:raise RuntimeError('Windows volume is not proven clean')
+ # ntfsinfo -F returns zero even when a path does not exist. Enumerate instead.
+ listing=run(['ntfsls','-p','/',volume])
+ names={line.strip().casefold() for line in listing.splitlines()}
+ if 'windows' not in names:raise RuntimeError('Cannot establish Windows root directory')
+ if 'hiberfil.sys' in names:raise RuntimeError('Windows hibernation file exists; fully shut down with hibernation disabled')
+
+
+def network(cfg):
+ n=cfg['network'];target=ipaddress.ip_network(n['subnet'])
+ exists=subprocess.run(['virsh','-c','qemu:///system','net-info',n['name']],capture_output=True).returncode==0
+ if exists:
+  import xml.etree.ElementTree as E
+  xml=E.fromstring(run(['virsh','-c','qemu:///system','net-dumpxml',n['name']]))
+  if xml.find('bridge').get('name')!=n['bridge'] or xml.find('ip').get('address')!=n['gateway'] or xml.find('forward').get('mode')!='nat':raise RuntimeError('Existing network differs')
+ else:
+  for row in json.loads(run(['ip','-j','-4','route','show','table','all'])):
+   dst=row.get('dst','default')
+   if dst!='default' and target.overlaps(ipaddress.ip_network(dst,strict=False)):raise RuntimeError('Guest subnet overlaps an existing route')
+  xml=f"<network><name>{n['name']}</name><forward mode='nat'/><bridge name='{n['bridge']}' stp='on' delay='0'/><ip address='{n['gateway']}' netmask='255.255.255.0'><dhcp><range start='172.30.61.100' end='172.30.61.200'/><host mac='{cfg['windows']['mac']}' name='windows' ip='172.30.61.11'/><host mac='{cfg['manjaro']['mac']}' name='manjaro' ip='172.30.61.12'/></dhcp></ip></network>"
+  file=RUN/'network.xml';file.write_text(xml);run(['virsh','-c','qemu:///system','net-define',file])
+ active=run(['virsh','-c','qemu:///system','net-list','--name']).splitlines()
+ if n['name'] not in active:run(['virsh','-c','qemu:///system','net-start',n['name']])
+
+def gpu_prepare(cfg,session):
+ members=cfg['gpu'];paths=[Path('/sys/bus/pci/devices')/b for b in members]
+ group=paths[0].joinpath('iommu_group').resolve()
+ if sorted(p.name for p in (group/'devices').iterdir())!=sorted(members):raise RuntimeError('Unexpected GPU IOMMU group')
+ if any(p.joinpath('iommu_group').resolve()!=group for p in paths):raise RuntimeError('GPU functions split across groups')
+ if paths[0].joinpath('boot_vga').read_text().strip()!='0':raise RuntimeError('NVIDIA is Host boot display')
+ for p in Path('/sys/class/graphics').glob('fb*/device'):
+  if any(b in str(p.resolve()) for b in members):raise RuntimeError('Host framebuffer uses passthrough GPU')
+ rescue=any(p.read_text().strip()=='connected' and '0000:65:00.0' in str(p.parent.resolve()) for p in Path('/sys/class/drm').glob('*/status'))
+ if not rescue:raise RuntimeError('AMD rescue display not connected')
+ for folder in ['drm','sound']:
+  for p in (Path('/sys/class')/folder).iterdir():
+   if any(b in str(p.resolve()) for b in members):
+    dev=Path('/dev/dri' if folder=='drm' else '/dev/snd')/p.name
+    if dev.exists() and subprocess.run(['fuser',str(dev)],capture_output=True).returncode!=1:raise RuntimeError('GPU/audio device busy')
+ old={p.name:(p/'driver').resolve().name if (p/'driver').exists() else None for p in paths}
+ if any((p/'driver_override').read_text().strip() not in ('','(null)') for p in paths):raise RuntimeError('Pre-existing GPU override')
+ atomic(session/'gpu-restore.json',old);run(['modprobe','vfio-pci'])
+ try:
+  for p in paths:
+   (p/'driver_override').write_text('vfio-pci')
+   if (p/'driver').exists():(p/'driver/unbind').write_text(p.name)
+   Path('/sys/bus/pci/drivers_probe').write_text(p.name)
+   if (p/'driver').resolve().name!='vfio-pci':raise RuntimeError('VFIO binding failed')
+ except BaseException:gpu_restore(session);raise
+
+def voice_card_prepare(cfg,session,sysroot=Path('/sys'),devroot=Path('/dev')):
+ card=cfg.get('voice_card',{});b=card.get('bdf','')
+ if not re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]',b):raise RuntimeError('Voice card not configured')
+ p=(sysroot/'bus/pci/devices')/b
+ if (p/'vendor').read_text().strip()!=card['vendor'] or (p/'device').read_text().strip()!=card['device']:raise RuntimeError('Voice card identity changed')
+ if (p/'class').read_text().strip()!='0x040300':raise RuntimeError('Voice card is not an HDA controller')
+ if sorted(x.name for x in (p/'iommu_group/devices').iterdir())!=[b]:raise RuntimeError('Voice card IOMMU group is not isolated')
+ for node in (sysroot/'class/sound').iterdir():
+  if b in str(node.resolve()):
+   dev=(devroot/'snd')/node.name
+   if dev.exists() and subprocess.run(['fuser',str(dev)],capture_output=True).returncode!=1:raise RuntimeError('Host is using voice card; close audio clients first')
+ if (p/'driver_override').read_text().strip() not in ('','(null)'):raise RuntimeError('Pre-existing voice card override')
+ old=(p/'driver').resolve().name if (p/'driver').exists() else None
+ atomic(session/'voice-card-restore.json',{b:old});run(['modprobe','vfio-pci'])
+ try:
+  (p/'driver_override').write_text('vfio-pci')
+  if (p/'driver').exists():(p/'driver/unbind').write_text(b)
+  (sysroot/'bus/pci/drivers_probe').write_text(b)
+  if (p/'driver').resolve().name!='vfio-pci':raise RuntimeError('Voice card VFIO binding failed')
+ except BaseException:gpu_restore(session,'voice-card');raise
+
+def gpu_restore(session,kind='gpu'):
+ file=session/(kind+'-restore.json')
+ if not file.exists():return
+ for b,old in json.loads(file.read_text()).items():
+  p=Path('/sys/bus/pci/devices')/b
+  if (p/'driver').exists() and (p/'driver').resolve().name=='vfio-pci':(p/'driver/unbind').write_text(b)
+  (p/'driver_override').write_text(old or '\n')
+  if old:
+   run(['modprobe',old]);Path('/sys/bus/pci/drivers_probe').write_text(b)
+   if not (p/'driver').exists() or (p/'driver').resolve().name!=old:raise RuntimeError('GPU restoration failed: '+b)
+  (p/'driver_override').write_text('\n')
+ atomic(session/(kind+'-restored.json'),{'restored':True})
+
+def qmp(path,command,arguments=None):
+ with socket.socket(socket.AF_UNIX) as s:
+  s.settimeout(5);s.connect(str(path));f=s.makefile('rwb');f.readline()
+  def execute(cmd,params=None):
+   payload={'execute':cmd}
+   if params is not None:payload['arguments']=params
+   f.write((json.dumps(payload)+'\n').encode());f.flush()
+   while True:
+    r=json.loads(f.readline())
+    if 'error' in r:raise RuntimeError(r['error'])
+    if 'return' in r:return r['return']
+  execute('qmp_capabilities');return execute(command,arguments)
+
+def validate_input_names(guest,names):
+ if not names:return
+ if guest not in ('windows','manjaro'):raise RuntimeError('Unsupported Guest')
+ helper=runpy.run_path(str(Path(__file__).with_name('epc-device')),run_name='input_preflight')
+ helper['select'](helper['discover'](),names)
+ if not helper['rescue_present']():raise RuntimeError('Laptop keyboard and touchpad must remain available')
+
+def attach_start_inputs(state,names,no_guest_reset=False):
+ if not names:return
+ state['input_requested']=names
+ try:
+  run(['/usr/local/bin/epc-device','give',state.get('os','windows'),*names]+(['--no-guest-reset'] if no_guest_reset else []))
+  state['input_status']='assigned'
+ except Exception as e:
+  state['input_status']='failed';state['input_error']=str(e)
+  print('Guest remains running; USB input assignment failed: '+str(e),file=sys.stderr,flush=True)
+ session=Path(state['session'])
+ atomic(session/'state.json',state);atomic(BASE/(state.get('os','windows')+'-latest.json'),state)
+
+def release_session_devices(session,name):
+ path=RUN/('input-lease.json' if name=='windows' else 'device-lease-manjaro.json')
+ if path.exists() and json.loads(path.read_text()).get('session')==str(session):
+  run(['/usr/local/bin/epc-device','release',name])
+
+def validate_cpu_plan(cfg,online=None,root=Path('/sys/devices/system/cpu')):
+ if not any(cfg[n].get('vcpu_pins') for n in ('windows','manjaro')):return
+ online=set(os.sched_getaffinity(0)) if online is None else set(online)
+ used=set();io=cfg.get('io_cpus',[])
+ if not io or len(set(io))!=len(io) or not set(io)<=online:raise RuntimeError('Invalid Host/I/O CPU set')
+ for name in ('windows','manjaro'):
+  p=cfg[name];pins=p.get('vcpu_pins',[])
+  if len(pins)!=p['vcpus'] or len(set(pins))!=len(pins) or len(pins)%2:raise RuntimeError('Invalid vCPU pin count')
+  if not set(pins)<=online or set(pins)&(used|set(io)):raise RuntimeError('Offline or overlapping CPU pins')
+  for a,b in zip(pins[::2],pins[1::2]):
+   siblings=(root/f'cpu{a}/topology/thread_siblings_list').read_text().strip()
+   expanded=set()
+   for part in siblings.split(','):
+    ends=[int(x) for x in part.split('-')];expanded.update(range(ends[0],ends[-1]+1))
+   if expanded!={a,b}:raise RuntimeError('CPU topology changed; expected complete SMT pairs')
+  used.update(pins)
+
+def pin_qemu(pid,session,p,io_cpus):
+ cpus=qmp(session/'qmp.sock','query-cpus-fast')
+ pins=p['vcpu_pins']
+ if sorted(c['cpu-index'] for c in cpus)!=list(range(len(pins))):raise RuntimeError('QEMU vCPU count differs from pin plan')
+ tasks=Path('/proc')/str(pid)/'task'
+ for c in cpus:
+  if not (tasks/str(c['thread-id'])).exists():raise RuntimeError('vCPU thread does not belong to this QEMU')
+ for task in tasks.iterdir():
+  try:os.sched_setaffinity(int(task.name),set(io_cpus))
+  except ProcessLookupError:pass
+ mapping=[]
+ for c in cpus:
+  tid=c['thread-id'];cpu=pins[c['cpu-index']];os.sched_setaffinity(tid,{cpu})
+  if os.sched_getaffinity(tid)!={cpu}:raise RuntimeError('CPU affinity verification failed')
+  mapping.append({'vcpu':c['cpu-index'],'tid':tid,'host_cpu':cpu})
+ return {'vcpus':mapping,'io_cpus':io_cpus,'strict_host_irq_isolation':False}
+
+def cpu_profile(name):
+ cpu='host,svm=off,vmx=off'
+ if name=='windows':cpu+=',hv-relaxed=on,hv-vapic=on,hv-time=on'
+ return cpu
+
+def cmdline(p,diskfd,overlay,var,session,name,cfg,gpu=False,network_on=True):
+ cpu=cpu_profile(name)
+ args=['qemu-system-x86_64','-no-user-config','-nodefaults','-name','elasticpc-'+name,'-uuid',p['uuid'],'-machine','q35,accel=kvm,mem-merge=off,dump-guest-core=off','-cpu',cpu,'-smp',str(p['vcpus']),'-m',str(p['ram_mib']),'-display','none','-device','VGA','-vnc','unix:'+str(session/'vnc.sock')+',password=on','-serial','file:'+str(session/'serial.log'),'-monitor','none','-qmp','unix:'+str(session/'qmp.sock')+',server=on,wait=off','-drive','if=pflash,format=raw,readonly=on,file=/usr/share/elasticpc/OVMF_CODE.fd','-drive',f'if=pflash,format=raw,file={var}','-device','qemu-xhci','-device','usb-tablet','-device','usb-kbd']
+ if p.get('vcpu_pins'):
+  args[args.index('-smp')+1]=f"{p['vcpus']},sockets=1,cores={p['vcpus']//2},threads=2"
+  args+=['-S']
+ readonly=overlay is not None
+ mode=os.fstat(diskfd).st_mode
+ if not (stat.S_ISREG(mode) or stat.S_ISBLK(mode)):raise RuntimeError('Unsupported source descriptor type')
+ driver='host_device' if stat.S_ISBLK(mode) else 'file'
+ args+=['-blockdev',json.dumps({'driver':driver,'filename':f'/proc/self/fd/{diskfd}','node-name':'native_file','read-only':readonly}),' -blockdev'.strip(),json.dumps({'driver':'raw','file':'native_file','node-name':'native','read-only':readonly})]
+ node='native'
+ if overlay:
+  args+=['-blockdev',json.dumps({'driver':'qcow2','file':{'driver':'file','filename':str(overlay)},'backing':'native','node-name':'trial'})]
+  args+=['-object','throttle-group,id=ramguard,x-bps-write=33554432','-blockdev',json.dumps({'driver':'throttle','throttle-group':'ramguard','file':'trial','node-name':'bounded'})];node='bounded'
+ if name=='manjaro':
+  args+=['-object','iothread,id=diskio','-device',f'virtio-blk-pci,drive={node},serial=EPC-{name},bootindex=2,iothread=diskio,rerror=stop,werror=stop']
+ else:args+=['-device',f'nvme,drive={node},serial=EPC-{name},bootindex=2']
+ if name=='windows':args+=['-drive','if=none,id=bridge,format=raw,readonly=on,file=/usr/share/elasticpc/windows-bridge.img','-device','usb-storage,drive=bridge,bootindex=1']
+ if network_on:
+  model=p.get('net_model','e1000e')
+  if model not in ('e1000e','virtio'):raise RuntimeError('Unsupported network model')
+  backend=f'tap,id=net,ifname={p["tap"]},script=no,downscript=no'
+  if model=='virtio':backend+=',vhost=on'
+  device=('virtio-net-pci' if model=='virtio' else 'e1000e')+f',netdev=net,mac={p["mac"]}'
+  args+=['-netdev',backend,'-device',device]
+ else:args+=['-nic','none']
+ if name=='manjaro':
+  args+=['-kernel','/usr/share/elasticpc/manjaro/vmlinuz','-initrd','/usr/share/elasticpc/manjaro/initrd','-append','root=UUID='+cfg['manjaro']['root_uuid']+' rw noresume systemd.swap=no systemd.gpt_auto=no console=tty0 console=ttyS0,115200 systemd.mask=systemd-hibernate.service systemd.mask=systemd-suspend.service' + (' systemd.mask=docker.service systemd.mask=docker.socket systemd.mask=containerd.service systemd.mask=k3s.service systemd.mask=mysqld.service systemd.mask=mysql.service systemd.mask=postgresql.service' if overlay else '')]
+ if gpu:
+  for b in cfg['gpu']:args+=['-device','vfio-pci,host='+b]
+ return args
+
+def trial_budget_mib(name):
+ return 6144 if name=='windows' else 3072
+
+def memory_budget(total,available,guest,other,own_cow,other_cow,reserve=6144):
+ if not isinstance(reserve,int) or reserve<4096:raise RuntimeError("Host reserve must be at least 4 GiB")
+ if total-guest-other-own_cow-other_cow<reserve:raise RuntimeError('Combined Guest budget exceeds physical memory minus Host reserve')
+ # Reserve includes memory already consumed by Host, not four additional free GiB.
+ host_used=max(0,total-available-other-other_cow)
+ headroom=max(1024,reserve-host_used)
+ if available<guest+headroom+own_cow:raise RuntimeError('Insufficient available memory; retain Host reserve')
+
+def execute(a,cfg):
+ validate_cpu_plan(cfg)
+ if getattr(a,'voice_card',False) and a.os!='windows':raise RuntimeError('Voice card passthrough is Windows-only')
+ p=dict(cfg[a.os]);p['net_model']=getattr(a,'net_model',None) or p.get('net_model','e1000e');BASE.mkdir(parents=True,exist_ok=True);RUN.mkdir(exist_ok=True)
+ lock=os.open(RUN/(a.os+'.lock'),os.O_CREAT|os.O_RDWR,0o600);fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+ if any(x.is_mount() for x in BASE.glob(a.os+'-*/store')):raise RuntimeError('This Guest still has an active or unsaved RAM trial. Stop/save/discard it first.')
+ source_guard(p)
+ if a.os=='windows':
+  windows_clean(p['disk']+'-part3')
+ else:
+  metadata=run(['dumpe2fs','-h',p['disk']+'-part1'])
+  if not re.search(r'Filesystem state:\s*clean\s*$',metadata,re.M):raise RuntimeError('Manjaro root filesystem not clean')
+ # Serialize memory admission and startup across both sessions.
+ admission=os.open(RUN/'admission.lock',os.O_CREAT|os.O_RDWR,0o600);fcntl.flock(admission,fcntl.LOCK_EX)
+ total=int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemTotal:')))//1024
+ other='manjaro' if a.os=='windows' else 'windows'
+ reserved=cfg[other]['ram_mib'] if subprocess.run(['systemctl','is-active','--quiet','elasticpc-'+other],capture_output=True).returncode==0 else 0
+ other_state=json.loads((BASE/(other+'-latest.json')).read_text()) if reserved and (BASE/(other+'-latest.json')).exists() else {}
+ other_cow=trial_budget_mib(other) if other_state.get('mode')=='trial' else 0
+ ram_cow=trial_budget_mib(a.os) if a.mode=='trial' else 0
+ available=int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemAvailable:')))//1024
+ memory_budget(total,available,p['ram_mib'],reserved,ram_cow,other_cow,cfg.get('host_reserve_mib',6144))
+ if a.mode=='direct':
+  if cfg.get('write_policy')!='validated-drivers-installed-native':raise RuntimeError('Direct mode blocked until the user selects the post-trial write policy')
+  approval=BASE/(a.os+'-direct-approved.json')
+  if not approval.exists():raise RuntimeError('Direct mode requires explicit trial acceptance first')
+  if json.loads(approval.read_text())['serial']!=p['serial']:raise RuntimeError('Direct approval identity changed')
+ session=BASE/(a.os+'-'+a.mode+'-'+uuid.uuid4().hex[:12]);session.mkdir(mode=0o700)
+ fd=os.open(p['disk'],(os.O_RDONLY if a.mode=='trial' else os.O_RDWR)|os.O_EXCL)
+ fingerprint=hashlib.sha256(os.pread(fd,1048576,0)).hexdigest()
+ if a.mode=='direct' and json.loads(approval.read_text())['source_header_sha256']!=fingerprint:raise RuntimeError('Source layout changed; redo trial acceptance')
+ state={'status':'starting','os':a.os,'mode':a.mode,'serial':p['serial'],'source_header_sha256':fingerprint,'gpu':a.gpu,'session':str(session),'started_at':time.time(),'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip()};atomic(session/'state.json',state);atomic(BASE/(a.os+'-latest.json'),state)
+ overlay=None;mounted=False;tap=False;child=None
+ try:
+  if a.mode=='trial':
+   if shutil.disk_usage(BASE).free<(ram_cow+2048)*1024**2:raise RuntimeError('Need '+str(ram_cow//1024+2)+' GiB free for RAM trial archive plus Host reserve')
+   mount=session/'store';mount.mkdir();run(['mount','-t','tmpfs','-o',f'size={ram_cow}M,noswap,mode=0700','tmpfs',mount]);mounted=True;overlay=mount/'trial.qcow2'
+   state.update(storage='ram',archive='pending',trial_capacity_bytes=ram_cow*1024**2);atomic(session/'state.json',state);atomic(BASE/(a.os+'-latest.json'),state)
+   run(['qemu-img','create','-f','qcow2','-F','raw','-b',p['disk'],overlay])
+  var=session/'vars.fd';shutil.copyfile('/usr/share/elasticpc/OVMF_VARS.fd',var)
+  if not a.offline:
+   network(cfg);run(['ip','tuntap','add','dev',p['tap'],'mode','tap']);tap=True;run(['ip','link','set',p['tap'],'master',cfg['network']['bridge']]);run(['ip','link','set',p['tap'],'up'])
+  if a.gpu:
+   if a.os!='windows':raise RuntimeError('GPU passthrough is Windows-only')
+   gpu_prepare(cfg,session)
+  if getattr(a,'voice_card',False):
+   if a.os!='windows':raise RuntimeError('Voice card passthrough is Windows-only')
+   voice_card_prepare(cfg,session);state['voice_card']=cfg['voice_card']['bdf']
+  if not a.offline and p['net_model']=='virtio':run(['modprobe','vhost_net'])
+  state['net_model']=p['net_model']
+  args=cmdline(p,fd,overlay,var,session,a.os,cfg,a.gpu,not a.offline)
+  if getattr(a,'voice_card',False):args+=['-device','vfio-pci,host='+cfg['voice_card']['bdf']]
+  with (session/'qemu.log').open('w') as log:
+   previous_affinity=os.sched_getaffinity(0)
+   try:
+    if p.get('vcpu_pins'):os.sched_setaffinity(0,set(cfg['io_cpus']))
+    child=subprocess.Popen(args,pass_fds=(fd,),stdout=log,stderr=subprocess.STDOUT)
+   finally:os.sched_setaffinity(0,previous_affinity)
+   # Admission reserve includes QEMU before another service starts; an early failure is handled below.
+   time.sleep(2)
+   if child.poll() is not None:raise RuntimeError('QEMU exited: '+(session/'qemu.log').read_text()[-4000:])
+   password=secrets.token_hex(4);(session/'console-password.txt').write_text(password+'\n');(session/'console-password.txt').chmod(0o600)
+   for attempt in range(60):
+    if child.poll() is not None:raise RuntimeError('QEMU exited: '+(session/'qemu.log').read_text()[-4000:])
+    try:qmp(session/'qmp.sock','set_password',{'protocol':'vnc','password':password});break
+    except (OSError,ValueError):time.sleep(1)
+   else:raise RuntimeError('QMP not ready')
+   if p.get('vcpu_pins'):
+    state['cpu_affinity']=pin_qemu(child.pid,session,p,cfg['io_cpus'])
+    qmp(session/'qmp.sock','cont')
+   state.update(status='running',pid=child.pid);atomic(session/'state.json',state);atomic(BASE/(a.os+'-latest.json'),state)
+   attach_start_inputs(state,getattr(a,'input',[]),getattr(a,'device_no_reset',False))
+   fcntl.flock(admission,fcntl.LOCK_UN);os.close(admission);admission=None
+   while child.poll() is None:
+    try:live=qmp(session/'qmp.sock','query-status')
+    except (OSError,ValueError):
+     if child.poll() is not None:code=child.returncode;break
+     time.sleep(2);continue
+    if live['status'] in ('io-error','guest-panicked'):
+     state.update(status=live['status'],blocks=qmp(session/'qmp.sock','query-block'));atomic(session/'state.json',state);atomic(BASE/(a.os+'-latest.json'),state)
+    if mounted and shutil.disk_usage(session/'store').free<512*1024**2:
+     qmp(session/'qmp.sock','stop');state.update(status='paused-space-limit');atomic(session/'state.json',state);atomic(BASE/(a.os+'-latest.json'),state)
+     time.sleep(2);continue
+    time.sleep(2)
+   else:code=child.returncode
+  forced=(session/'forced-stop.json').exists()
+  state.update(status='forced-stopped' if forced else ('stopped' if code==0 else 'failed'),exit_code=code)
+ except BaseException as e:
+  state.update(status='failed',error=str(e));raise
+ finally:
+  # A Host shutdown must not interrupt a completed Guest's RAM archive midway.
+  # systemd still applies the configured final timeout; physical power loss cannot be prevented.
+  signal.signal(signal.SIGTERM,signal.SIG_IGN)
+  if child and child.poll() is None:
+   try:qmp(session/'qmp.sock','system_powerdown');child.wait(timeout=45)
+   except Exception:child.kill();child.wait()
+  cleanup_errors=[]
+  for cleanup in ([lambda:release_session_devices(session,a.os),lambda:gpu_restore(session,'voice-card'),lambda:gpu_restore(session)]+([lambda:run(['ip','link','delete',p['tap']])] if tap else [])):
+   try:cleanup()
+   except Exception as e:cleanup_errors.append(str(e))
+  if mounted:
+   final_status=state['status']
+   try:
+    if not discard_requested(session):
+     state.update(status='saving',archive='saving');atomic(session/'state.json',state);atomic(BASE/(a.os+'-latest.json'),state)
+     archive_ram(session)
+    if discard_requested(session):discard_ram(session,state)
+    else:
+     run(['umount',session/'store']);state.update(status=final_status,archive='saved')
+   except BaseException as e:
+    if isinstance(e,DiscardTrial):
+     try:discard_ram(session,state)
+     except Exception as cleanup:state.update(status='save-failed',archive='failed',archive_error=str(cleanup))
+    else:state.update(status='save-failed',archive='failed',archive_error=str(e))
+  if cleanup_errors:state.update(status='cleanup-failed',cleanup_errors=cleanup_errors)
+  os.close(fd)
+  if admission is not None:os.close(admission)
+  atomic(session/'state.json',state);atomic(BASE/(a.os+'-latest.json'),state)
+  os.close(lock)
+
+class DiscardTrial(RuntimeError):pass
+
+def discard_requested(session):
+ return (RUN/(session.name+'-discard.json')).exists()
+
+def check_discard(session):
+ if discard_requested(session):raise DiscardTrial('Owner requested discard without saving')
+
+def discard_ram(session,state):
+ # Caller owns the Guest lock and has already reaped QEMU, or verified it absent.
+ if (session/'store').is_mount():run(['umount',session/'store'])
+ for name in ('trial-saving.qcow2','trial-saved.qcow2'):
+  (session/name).unlink(missing_ok=True)
+ atomic(session/'archive.json',{'status':'discarded','requested_by_user':True,'time':time.time()})
+ state.update(status='discarded',archive='discarded',discard_requested=True)
+ state.pop('archive_error',None)
+
+def request_discard(session,state):
+ if state.get('mode')!='trial' or state.get('storage')!='ram':
+  raise RuntimeError('Discard is RAM-trial-only. Direct writes cannot be undone; use stop --force to terminate a direct Guest.')
+ if state.get('archive') in ('saved','discarded'):
+  raise RuntimeError('Trial already finalized; refusing to delete an existing saved archive')
+ atomic(RUN/(session.name+'-discard.json'),{'requested_by_user':True,'time':time.time()})
+ lock=os.open(RUN/(state['os']+'.lock'),os.O_CREAT|os.O_RDWR,0o600)
+ try:
+  try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  except BlockingIOError:
+   if state.get('status')!='saving':control('stop',True,session,state)
+   print('Discard requested. Wait for status discarded and service exit; no new archive will be retained.');return
+  # No worker: handle a failed archive without starting a save. Refuse orphan QEMU.
+  try:qmp(session/'qmp.sock','query-status')
+  except (OSError,ValueError,RuntimeError):pass
+  else:raise RuntimeError('Unexpected live QEMU without worker lock; inspect service')
+  pid=state.get('pid')
+  if pid:
+   try:
+    args=(Path('/proc')/str(pid)/'cmdline').read_bytes()
+    if b'qemu-system' in args and str(session/'qmp.sock').encode() in args:raise RuntimeError('Guest process still exists')
+   except FileNotFoundError:pass
+  discard_ram(session,state);atomic(session/'state.json',state);atomic(BASE/(state['os']+'-latest.json'),state)
+  print('RAM trial discarded; no archive saved.')
+ finally:os.close(lock)
+
+
+def archive_progress(session):
+ path=RUN/(session.name+'-archive.json')
+ if not path.exists():return None
+ progress=json.loads(path.read_text())
+ progress['elapsed_seconds']=round(time.monotonic()-progress['started_monotonic'],1)
+ progress['phase_elapsed_seconds']=round(time.monotonic()-progress['phase_started_monotonic'],1)
+ return progress
+
+
+def archive_ram(session):
+ check_discard(session)
+ source=session/'store/trial.qcow2';dest=session/'trial-saved.qcow2';temp=session/'trial-saving.qcow2'
+ if not source.is_file():raise RuntimeError('RAM overlay is missing; cannot report archive saved')
+ total=source.stat().st_size
+ if shutil.disk_usage(session).free<total+512*1024**2:raise RuntimeError('Not enough USB space; RAM copy retained. Free space and use epc save.')
+ RUN.mkdir(exist_ok=True)
+ progress={'session':str(session),'phase':'copying','total_bytes':total,'copied_bytes':0,'verified_bytes':0,'written_bytes':0,'zero_bytes_skipped':0,
+           'started_monotonic':time.monotonic(),'phase_started_monotonic':time.monotonic()}
+ last=0
+ def publish(phase=None):
+  nonlocal last
+  now=time.monotonic()
+  if phase is not None:
+   progress['phase']=phase;progress['phase_started_monotonic']=now
+  if phase is not None or now-last>=150:
+   atomic(RUN/(session.name+'-archive.json'),progress);last=now
+ # Write progress to RAM, not the slow USB filesystem. Flush is a separate phase.
+ old_handler=signal.signal(signal.SIGTERM,signal.SIG_IGN)
+ try:
+  publish('copying');temp.unlink(missing_ok=True);h=hashlib.sha256()
+  with source.open('rb') as src,temp.open('wb') as target:
+   while chunk:=src.read(4*1024**2):
+    check_discard(session)
+    if chunk.count(0)==len(chunk):target.seek(len(chunk),os.SEEK_CUR);progress['zero_bytes_skipped']+=len(chunk)
+    else:target.write(chunk);progress['written_bytes']+=len(chunk)
+    h.update(chunk);progress['copied_bytes']+=len(chunk);publish()
+   target.truncate(total)
+   check_discard(session);publish('flushing');target.flush();os.fsync(target.fileno());check_discard(session)
+  publish('verifying');verified=hashlib.sha256()
+  with temp.open('rb') as check:
+   while chunk:=check.read(4*1024**2):
+    check_discard(session)
+    verified.update(chunk);progress['verified_bytes']+=len(chunk);publish()
+  if verified.hexdigest()!=h.hexdigest():raise RuntimeError('Archive verification failed; RAM copy retained')
+  check_discard(session);publish('committing');temp.replace(dest)
+  fd=os.open(session,os.O_RDONLY)
+  try:os.fsync(fd)
+  finally:os.close(fd)
+  atomic(session/'archive.json',{'status':'saved','sha256':h.hexdigest(),'bytes':dest.stat().st_size,'path':str(dest),'time':time.time()})
+  publish('saved')
+ except BaseException as e:
+  progress['error']=str(e);publish('failed');raise
+ finally:signal.signal(signal.SIGTERM,old_handler)
+
+
+def control(command,force,session,state):
+ sock=session/'qmp.sock'
+ if state.get('status')=='saving':
+  print('Guest already stopped; archive is still saving. Do NOT kill the service or power off Host. Use epc status '+state['os']);return
+ if command=='stop' and not force and state.get('status')=='paused-space-limit':
+  raise RuntimeError('Guest is paused because RAM trial is full; normal shutdown cannot run. Use epc stop '+state['os']+' --force, then wait for archive saved. Do NOT power off Host.')
+ if command=='restart':
+  if not force:raise RuntimeError('For an unresponsive Guest use epc restart '+state['os']+' --force (hardware reset; unsaved data may be lost). For normal reboot, use the Guest OS.')
+  live=qmp(sock,'query-status')
+  if live['status'] in ('io-error','paused') or state['status']=='paused-space-limit':raise RuntimeError('Resolve storage/pause condition before reset; use stop --force if necessary')
+  atomic(session/'last-reset.json',{'forced':True,'time':time.time()});qmp(sock,'system_reset');print('Guest hardware reset requested; same trial retained.');return
+ if command=='stop' and force:
+  atomic(session/'forced-stop.json',{'forced':True,'time':time.time()})
+  try:qmp(sock,'quit')
+  except (OSError,ValueError,RuntimeError):
+   # Target only this recorded QEMU session, never kill arbitrary matching processes.
+   pid=state.get('pid')
+   if not pid:raise RuntimeError('No recorded QEMU PID; inspect service before forcing stop')
+   pidfd=os.pidfd_open(pid)
+   try:
+    cmd=Path('/proc')/str(pid)/'cmdline';args=cmd.read_bytes().split(b'\0')
+    if not args or b'qemu-system' not in args[0] or not any(str(sock).encode() in v for v in args):raise RuntimeError('Recorded PID is not this Guest')
+    signal.pidfd_send_signal(pidfd,signal.SIGKILL)
+   finally:os.close(pidfd)
+  print('Forced power-off requested. Wait for status forced-stopped and cleanup before powering off Host.');return
+ if command=='resume':
+  store=session/'store'
+  if store.is_mount() and shutil.disk_usage(store).free<512*1024**2:raise RuntimeError('Trial storage still too full to resume')
+  if any(x.get('io-status','ok')!='ok' for x in qmp(sock,'query-block')):raise RuntimeError('Unresolved storage I/O error')
+ if command=='stop' and not force:
+  live=qmp(sock,'query-status')
+  if live.get('status') in ('paused','io-error','guest-panicked'):
+   raise RuntimeError('Guest is not executing; ACPI shutdown cannot complete. Inspect epc status, then explicitly stop --force to preserve trial writes.')
+ operation={'stop':'system_powerdown','pause':'stop','resume':'cont'}[command]
+ qmp(sock,operation);print('Guest '+command+' requested.')
+
+
+def reconcile_stale(name):
+ latest=BASE/(name+'-latest.json');failure=BASE/(name+'-last-error.json')
+ service=subprocess.run(['systemctl','is-active','--quiet','elasticpc-'+name],capture_output=True)
+ if service.returncode not in (3,4):return False
+ lock=os.open(RUN/(name+'.lock'),os.O_CREAT|os.O_RDWR,0o600)
+ try:
+  try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  except BlockingIOError:return False
+  if any(x.is_mount() for x in BASE.glob(name+'-*/store')):return False
+  state=json.loads(latest.read_text()) if latest.exists() else {}
+  if state:
+   session=Path(state.get('session',''))
+   if session.parent!=BASE or not session.name.startswith(name+'-'):raise RuntimeError('Invalid stale session path')
+   try:qmp(session/'qmp.sock','query-status')
+   except (OSError,ValueError,RuntimeError):pass
+   else:return False
+   pid=state.get('pid')
+   if pid:
+    try:
+     args=(Path('/proc')/str(pid)/'cmdline').read_bytes()
+     if b'qemu-system' in args and str(session/'qmp.sock').encode() in args:return False
+    except FileNotFoundError:pass
+   current=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+   if state.get('boot_id')==current:return False
+   if state.get('status') in ('starting','running','saving','save-failed','paused-space-limit','io-error','guest-panicked'):
+    atomic(session/('pre-reconcile-'+uuid.uuid4().hex[:8]+'.json'),state)
+    state.update(status='interrupted',pid=None,reconciled_from_previous_boot=True)
+    if state.get('mode')=='trial' and state.get('archive')!='saved':state['archive']='incomplete'
+    atomic(session/'state.json',state);atomic(latest,state)
+  # Prior-boot errors must not shadow a new startup; retain the evidence as history.
+  if failure.exists():
+   error=json.loads(failure.read_text())
+   uptime=float(Path('/proc/uptime').read_text().split()[0])
+   if error.get('time',0)<time.time()-uptime:failure.rename(BASE/(name+'-error-history-'+uuid.uuid4().hex[:8]+'.json'))
+  return True
+ finally:os.close(lock)
+
+
+def main():
+ p=argparse.ArgumentParser(description='Explicit USB Host trial/direct sessions; no native boot changes.')
+ sub=p.add_subparsers(dest='command',required=True)
+ for name in ['start','_run']:
+  s=sub.add_parser(name);s.add_argument('--device-no-reset',action='store_true',help='USB receiver compatibility experiment');s.add_argument('--device','--input',dest='input',action='append',default=[],metavar='DEVICE_NAME',help='Assign named USB HID/audio to Guest; repeat for each device');s.add_argument('os',type=lambda x:'manjaro' if x=='linux' else x,choices=['windows','manjaro']);s.add_argument('--mode',choices=['trial','direct'],default='trial');s.add_argument('--gpu',action='store_true');s.add_argument('--voice-card',action='store_true',help='Pass isolated onboard 3.5mm HDA controller to Windows');s.add_argument('--offline',action='store_true');s.add_argument('--net-model',choices=['e1000e','virtio'],help='virtio uses vhost-net; Windows requires installed NetKVM driver')
+ for name in ['status','stop','restart','pause','resume','console','password','save','diagnose','accept-trial','clear-stale']:
+  s=sub.add_parser(name);s.add_argument('os',type=lambda x:'manjaro' if x=='linux' else x,choices=['windows','manjaro'])
+  if name in ('stop','restart'):s.add_argument('--force',action='store_true')
+  if name=='stop':s.add_argument('--discard',action='store_true',help='With --force: discard current RAM trial without saving; refuses direct mode')
+  if name=='accept-trial':
+   s.add_argument('--confirm-boot-and-drivers',action='store_true')
+   s.add_argument('--confirm-native-drivers-ready',action='store_true')
+ sub.add_parser('network')
+ a=p.parse_args();cfg=json.loads(CONF.read_text());host_guard(cfg);RUN.mkdir(exist_ok=True)
+ if a.command=='network':network(cfg);return
+ if a.command in ('start','status','clear-stale'):
+  reconciled=reconcile_stale(a.os)
+  if a.command=='clear-stale':
+   print('Stale state reconciled; logs preserved.' if reconciled else 'Active/current session retained; nothing cleared.');return
+ if a.command=='start':
+  validate_input_names(a.os,a.input)
+  args=['systemd-run','--unit=elasticpc-'+a.os,'--collect','--property=KillMode=mixed','--property=TimeoutStopSec=1800','/usr/local/bin/epc','_run',a.os,'--mode',a.mode]
+  for device in a.input:args+=['--input',device]
+  if a.gpu:args+=['--gpu']
+  if a.voice_card:args+=['--voice-card']
+  if a.device_no_reset:args+=['--device-no-reset']
+  if a.offline:args+=['--offline']
+  if a.net_model:args+=['--net-model',a.net_model]
+  run(args)
+  print('Startup requested. Preparing trial storage may take minutes on USB. Use epc status '+a.os+' for progress.');return
+ if a.command=='_run':
+  def interrupted(signum,frame):
+   signal.signal(signal.SIGTERM,signal.SIG_IGN)
+   raise InterruptedError('Service interrupted; attempting Guest shutdown and RAM archive')
+  signal.signal(signal.SIGTERM,interrupted)
+  try:execute(a,cfg)
+  except BaseException as e:
+   # Failures before session creation must also be visible after reboot.
+   error={'status':'failed','os':a.os,'mode':a.mode,'error':str(e),'time':time.time()}
+   atomic(BASE/(a.os+'-last-error.json'),error)
+   raise
+  return
+ latest=BASE/(a.os+'-latest.json');failure=BASE/(a.os+'-last-error.json')
+ if a.command not in ('password','stop','restart','save') and failure.exists() and (not latest.exists() or failure.stat().st_mtime>latest.stat().st_mtime):
+  error=json.loads(failure.read_text())
+  if a.command=='status':print(json.dumps(error,indent=2));return
+  raise RuntimeError(error['error'])
+ if not latest.exists():
+  raise RuntimeError('No Guest session yet. Inspect: journalctl -u elasticpc-'+a.os+' --no-pager -n 40')
+ state=json.loads(latest.read_text());session=Path(state['session'])
+ if a.command=='save':
+  lock=os.open(RUN/(a.os+'.lock'),os.O_CREAT|os.O_RDWR,0o600);fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  try:
+   if not (session/'store').is_mount():raise RuntimeError('No pending RAM store; inspect status archive field')
+   archive_ram(session);run(['umount',session/'store']);state.update(status='stopped-unverified',archive='saved');atomic(session/'state.json',state);atomic(latest,state)
+  finally:os.close(lock)
+  print('RAM trial saved; Guest boot validity is not implied.');return
+ if a.command=='password':
+  print('VNC password: '+(session/'console-password.txt').read_text().strip());return
+ if a.command=='console':
+  qmp(session/'qmp.sock','query-status')
+  ip=run(['tailscale','ip','-4']).strip();address=ipaddress.ip_address(ip)
+  if address not in ipaddress.ip_network('100.64.0.0/10'):raise RuntimeError('Log this Host into Tailscale first')
+  port=6080+cfg[a.os]['vnc']
+  rule=['-d',ip,'-p','tcp','--dport',str(port),'!','-i','tailscale0','-j','REJECT']
+  if subprocess.run(['iptables','-C','INPUT',*rule],capture_output=True).returncode!=0:run(['iptables','-I','INPUT',*rule])
+  console_unit='elasticpc-console-'+a.os
+  active=subprocess.run(['systemctl','is-active','--quiet',console_unit],capture_output=True).returncode==0
+  console_state=BASE/(a.os+'-console.json')
+  expected={'session':str(session),'ip':ip,'port':port}
+  same=console_state.exists() and json.loads(console_state.read_text())==expected
+  if active and not same:run(['systemctl','stop',console_unit]);active=False
+  if not active:
+   run(['systemd-run','--unit='+console_unit,'--collect','websockify','--web=/usr/share/novnc','--unix-target='+str(session/'vnc.sock'),ip+':'+str(port)])
+   atomic(console_state,expected)
+  print('Browser: http://'+ip+':'+str(port)+'/vnc.html?autoconnect=true&resize=scale&host='+ip+'&port='+str(port)+'&encrypt=false&path=websockify')
+  print('VNC password: '+(session/'console-password.txt').read_text().strip());return
+ if a.command=='diagnose':
+  data={'state':state,'time':time.time()}
+  data['host_memory']=Path('/proc/meminfo').read_text()
+  data['host_pressure']={n:(Path('/proc/pressure')/n).read_text() for n in ('cpu','memory','io') if (Path('/proc/pressure')/n).exists()}
+  for command in ('query-status','query-block','query-blockstats','query-vnc','query-pci','query-cpus-fast'):
+   try:data[command]=qmp(session/'qmp.sock',command)
+   except Exception as e:data[command]={'error':str(e)}
+  try:qmp(session/'qmp.sock','screendump',{'filename':str(session/'screen.ppm')})
+  except Exception as e:data['screen_error']=str(e)
+  unit='elasticpc-console-'+a.os
+  data['console_service']={}
+  for label,args in [('status',['systemctl','status','--no-pager','--full',unit]),('journal',['journalctl','-u',unit,'-b','--no-pager','-n','100']),('listeners',['ss','-ltnp'])]:
+   try:
+    result=subprocess.run(args,text=True,capture_output=True,timeout=10)
+    data['console_service'][label]={'exit_code':result.returncode,'output':(result.stdout+result.stderr)[-16000:]}
+   except (OSError,subprocess.TimeoutExpired) as e:data['console_service'][label]={'error':str(e)}
+  atomic(session/'diagnostics.json',data);print('Saved diagnostics and available screenshot in '+str(session));return
+ if a.command=='status':
+  state['elapsed_seconds']=round(time.time()-state.get('started_at',time.time()))
+  state['archive_progress']=archive_progress(session)
+  if (session/'store').is_mount():
+   usage=shutil.disk_usage(session/'store');state['trial_capacity_bytes']=usage.total;state['trial_free_bytes']=usage.free
+  try:
+   state['qmp']=qmp(session/'qmp.sock','query-status')
+   state['disk_stats']=qmp(session/'qmp.sock','query-blockstats')
+  except (OSError,ValueError):state['qmp']='unreachable; inspect service, not proof of stop'
+  print(json.dumps(state,indent=2));return
+ if a.command in ('stop','restart','pause','resume'):
+  if getattr(a,'discard',False):
+   if not a.force:raise RuntimeError('--discard requires --force')
+   request_discard(session,state);return
+  control(a.command,getattr(a,'force',False),session,state);return
+ if cfg.get('write_policy')!='validated-drivers-installed-native':raise RuntimeError('Post-trial write policy is unresolved; preserve the complete trial')
+ if not a.confirm_native_drivers_ready:raise RuntimeError('Apply any required driver packages to the native installation before accepting direct mode')
+ if not a.confirm_boot_and_drivers:raise RuntimeError('Explicit user attestation of successful trial required')
+ lock=os.open(RUN/(a.os+'.lock'),os.O_CREAT|os.O_RDWR,0o600);fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+ if state['mode']!='trial' or state['status']!='stopped' or state.get('exit_code')!=0:raise RuntimeError('Require a cleanly stopped trial')
+ source_guard(cfg[a.os]);atomic(BASE/(a.os+'-direct-approved.json'),{'serial':state['serial'],'source_header_sha256':state['source_header_sha256'],'trial':str(session),'user_attested_boot_and_drivers':True,'trial_changes_merged':False})
+ print('Direct mode approved. Trial modifications are NOT merged. Apply required signed driver packages separately before switching.')
+ os.close(lock)
+if __name__=='__main__':
+ try:main()
+ except Exception as e:print('REFUSED/FAILED: '+str(e),file=sys.stderr);sys.exit(1)

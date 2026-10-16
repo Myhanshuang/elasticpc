@@ -1,0 +1,18 @@
+[package]
+name = "elastic-virt-libvirt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+native-libvirt = ["dep:virt"]
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+roxmltree = "0.20"
+virt = { version = "=0.4.3", optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true

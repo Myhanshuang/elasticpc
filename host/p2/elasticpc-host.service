@@ -1,0 +1,12 @@
+[Unit]
+Description=ElasticPC Host readiness
+Wants=libvirtd.socket
+After=local-fs.target libvirtd.socket libvirtd.service
+[Service]
+Type=oneshot
+StandardOutput=journal+console
+StandardError=journal+console
+ExecStart=/usr/lib/elasticpc/host-start
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+Driver staging policy
+
+Trial writes remain in its complete, bounded COW store. No automatic merge or deletion.
+Driver packages are retained independently under /var/lib/elasticpc/driver-packages.
+Store original vendor packages with SHA256, version, target OS, source and trial result.
+Do not treat a copy of DriverStore files or registry hives as an installation package.
+Windows: use an administrator terminal and the original signed INF package with pnputil.
+Do not remove original NVIDIA, AMD, USB, AHCI or NVMe drivers.
+A required boot/storage driver must be applied before the first direct boot through that controller.
+Initial Windows profile uses emulated NVMe because the inspected installation has stornvme enabled;
+this is a candidate, not proof that this Windows installation boots or is BitLocker-ready.
+No VirtIO storage driver is forced into the original installation by this bundle.
+Manjaro profile uses the exported kernel/initramfs and original filesystem UUID; no driver packages removed.
+After native writes or a native reboot, do not resume old COW stores. They remain as retained artifacts.

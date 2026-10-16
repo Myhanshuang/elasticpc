@@ -1,0 +1,37 @@
+#!/bin/sh
+# This rehearsal removes owned files only; it does not resize partitions.
+set -eu
+[ "$(id -u)" -eq 0 ]
+[ -f /etc/elasticpc/image-version ]
+systemd-detect-virt --vm >/dev/null
+(cd /boot/efi && sha256sum -c /etc/elasticpc/owned-efi.sha256)
+(cd /boot/efi && sha256sum -c /etc/elasticpc/original-efi.sha256)
+# Only the uniquely named entry created by this disposable image is removed.
+efibootmgr > /run/elasticpc-efi-before-uninstall.txt
+entries=$(/usr/lib/elasticpc/owned-efi-entry < /run/elasticpc-efi-before-uninstall.txt)
+efibootmgr -b "$entries" -B
+rm -r /boot/efi/EFI/ElasticPC
+systemctl disable elasticpc-host.service
+rm /etc/grub.d/41_elasticpc_recovery
+update-grub
+(cd /boot/efi && sha256sum -c /etc/elasticpc/original-efi.sha256)
+rm /etc/systemd/system/elasticpc-host.service /etc/systemd/system/elasticpc-recovery.service /etc/systemd/system/elasticpc-recovery.target
+rm /usr/local/bin/elasticctl
+rm -r /usr/lib/elasticpc
+systemctl daemon-reload
+echo ELASTICPC_NATIVE_EFI_PRESERVED
+# A one-boot verifier exists only in the disposable test overlay.
+if [ "$(cat /run/elasticpc-seed/elasticpc-test-mode 2>/dev/null || true)" = uninstall ]; then
+cat > /etc/systemd/system/elasticpc-uninstall-verification.service <<'UNIT'
+[Unit]
+Description=Disposable P2 fallback boot verification
+After=local-fs.target
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -ec 'test ! -d /boot/efi/EFI/ElasticPC; test ! -e /usr/local/bin/elasticctl; cd /boot/efi; sha256sum -c /etc/elasticpc/original-efi.sha256; efibootmgr > /run/elasticpc-efi-after-uninstall.txt; ! cut -f1 /run/elasticpc-efi-after-uninstall.txt | grep -E "^Boot[0-9A-Fa-f]{4}[*]? ElasticPC$"; echo ELASTICPC_P2_FALLBACK_OK > /dev/ttyS0; systemctl disable elasticpc-uninstall-verification.service; rm /etc/systemd/system/elasticpc-uninstall-verification.service; systemctl poweroff --no-block'
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable elasticpc-uninstall-verification.service
+fi

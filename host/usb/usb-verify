@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+systemd-detect-virt --vm >/dev/null || exit 0
+mkdir -p /run/elasticpc-usb-test
+mount -o ro /dev/disk/by-label/cidata /run/elasticpc-usb-test 2>/dev/null || exit 0
+mode=$(cat /run/elasticpc-usb-test/elasticpc-test-mode 2>/dev/null || true)
+case "$mode" in usb-first|usb-second) ;; *) exit 0;; esac
+exec > /dev/ttyS0 2>&1
+failed() { echo ELASTICPC_USB_VERIFY_FAILED; sync; systemctl poweroff --no-block; }
+trap failed EXIT
+for module in usb_storage uas xhci_pci ext4 amdgpu mt7921e r8169 kvm_amd; do modinfo "$module" >/dev/null; done
+systemctl is-active NetworkManager
+systemctl is-active elasticpc-host
+! systemctl is-active --quiet ssh.service
+! systemctl is-active --quiet ssh.socket
+[ -s /boot/efi/EFI/BOOT/BOOTX64.EFI ]
+[ -s /boot/efi/EFI/BOOT/grubx64.efi ]
+findmnt /
+lsblk -o NAME,TRAN,SIZE,FSTYPE,MOUNTPOINTS
+/usr/local/bin/elasticctl doctor --json > /var/lib/elasticpc/usb-doctor.json
+python3 -c 'import json; json.load(open("/var/lib/elasticpc/usb-doctor.json"))'
+virsh -c qemu:///system list --all
+if [ "$mode" = usb-first ]; then
+ printf 'USB persistence verified\n' > /var/lib/elasticpc/usb-persistence-test
+else
+ grep -qx 'USB persistence verified' /var/lib/elasticpc/usb-persistence-test
+fi
+sync
+echo "ELASTICPC_USB_OK_$mode"
+trap - EXIT
+systemctl poweroff --no-block

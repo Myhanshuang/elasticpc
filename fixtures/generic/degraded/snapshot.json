@@ -1,0 +1,9 @@
+{
+  "provenance": "Synthetic inaccessible/empty host; every missing source stays unknown.",
+  "errors": [
+    "/usr/bin/lsblk unavailable",
+    "/usr/bin/lspci unavailable",
+    "/usr/bin/efibootmgr unavailable",
+    "/sys/bus/pci/devices permission denied"
+  ]
+}

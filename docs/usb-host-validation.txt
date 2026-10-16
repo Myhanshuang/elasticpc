@@ -1,0 +1,53 @@
+ElasticPC UDisk Host 验证步骤
+
+范围
+此版本是独立 Debian Host 命令行系统，不是已完成的 Windows/Manjaro 双桌面。
+当前主机 EFI 启动项和原系统驱动不应被改变；不自动导入或挂载原系统分区。
+测试 UDisk 前 15,997,075,456 字节完整写读和断电后全量读回均通过。
+这不是对长期寿命、剩余虚报空间或可靠备份能力的保证。
+
+开始前
+先确认 reports/udisk-host-deployment.json 的 status 为 passed。
+若仍为 running，不拔盘、不重启；failed 时先查看原因。
+登录凭据在本次镜像目录 local-login.txt，仅限当前用户读取。
+USB Host 未安装图形桌面，登录后显示命令行属于预期。
+
+步骤 2：实体启动，由用户执行
+1. 保存当前工作，正常重启，从一次性启动菜单选择 UDisk 的 UEFI 启动项。
+   不需要修改默认启动顺序。不选择内部盘或 Windows T7 作为安装目标。
+2. 应出现 GRUB 菜单并进入 elasticpc-host 登录界面。
+   使用 root 和本次生成的密码登录。没有 root 自动登录，SSH 已禁用。
+3. 执行以下只读检查：
+   uname -r
+   free -h
+   lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS
+   findmnt /
+   systemctl --failed
+   elasticctl doctor --json
+   test -e /dev/kvm && echo KVM_DEVICE_PRESENT
+   nmcli device status
+4. 根文件系统应位于 U 盘约 12 GiB 镜像的分区中，不能增长到虚报 125 GiB。
+   内部 Manjaro 和 T7 Windows 分区不应自动挂载。
+5. 网络可使用 nmtui 手动配置。没有从原系统复制无线密码或 Tailscale 身份。
+   检查本机屏幕、USB 键盘；外接显示和 Wi-Fi 需实体确认。
+6. 写入本次 USB Host 自己的测试文件：
+   echo 'physical USB boot OK' > /root/usb-physical-test
+   sync
+   poweroff
+   再次从 U 盘启动后检查：cat /root/usb-physical-test
+
+步骤 3：原生回退，由用户执行
+1. 在 USB Host 中正常 poweroff，完全关机后拔下 UDisk。
+2. 从原有启动菜单进入 Manjaro，检查登录、屏幕、网络及原有驱动。
+3. 正常关闭 Manjaro，再从原有启动菜单进入 Windows，检查登录和显卡。
+4. 不同时以虚拟机和原生方式启动同一个系统；本阶段尚未启动原盘 Guest。
+
+失败时
+记录停在哪个画面、错误文字及启动方式。
+若遇到 Secure Boot 验证错误，先记录错误，不修改原系统驱动或 EFI 文件。
+无需执行修复分区、重装 GRUB 到内部磁盘、格式化原系统等操作。
+Host 已禁用自动扩容和 discard/fstrim，保留现有系统原生启动路径。
+
+尚未验收
+物理 UEFI/Secure Boot、显示输出、Wi-Fi/有线联网、物理 KVM Guest 启动、
+Windows/Manjaro 导入、NVIDIA 直通、Tailscale 身份与直连，均不得仅凭虚拟启动认定通过。

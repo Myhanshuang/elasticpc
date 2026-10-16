@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Named USB HID/audio passthrough; laptop keyboard/touchpad remain with Host."""
+import time
+import argparse,fcntl,hashlib,json,os,runpy,sys
+from pathlib import Path
+SYS=Path('/sys');RUN=Path('/run/elasticpc');BASE=Path('/var/lib/elasticpc/runtime')
+def read(p):
+ try:return p.read_text().strip()
+ except OSError:return None
+def discover():
+ result=[]
+ for p in sorted((SYS/'bus/usb/devices').glob('*')):
+  if ':' in p.name or p.name.startswith('usb'):continue
+  vid,pid=read(p/'idVendor'),read(p/'idProduct')
+  if not vid or not pid:continue
+  interfaces=list((SYS/'bus/usb/devices').glob(p.name+':*'))
+  classes=[read(i/'bInterfaceClass') for i in interfaces]
+  eligible=bool(classes) and all(c in ('01','03') for c in classes)
+  name=read(p/'product') or (vid+':'+pid)
+  identity=p.name+':'+vid+':'+pid+':'+(read(p/'serial') or '')
+  result.append({'id':'epc-input-'+hashlib.sha256(identity.encode()).hexdigest()[:16],
+   'kind':'usb-audio' if '01' in classes else 'usb-hid','interface_classes':classes,
+   'name':name,'selector':name+'@'+p.name,'eligible':eligible,
+   'reason':None if eligible else 'Only USB HID/audio interfaces are supported; storage, hubs, cameras and Bluetooth stay with Host',
+   'port':p.name,'vid':vid,'product_id':pid,'serial':read(p/'serial'),
+   'hostbus':int(read(p/'busnum')),'hostaddr':int(read(p/'devnum')),
+   'interfaces':[i.name for i in interfaces],
+   'interface_drivers':{i.name:(i/'driver').resolve().name if (i/'driver').exists() else None for i in interfaces}})
+ return result
+def select(devices,names):
+ if not names:raise RuntimeError('Specify device names from epc-input list')
+ selected=[]
+ for name in names:
+  exact=[d for d in devices if d.get('name','').casefold()==name.casefold()]
+  matches=exact or [d for d in devices if d.get('selector','').casefold()==name.casefold()]
+  if len(matches)!=1:
+   choices=', '.join(d.get('selector',d['id']) for d in matches)
+   raise RuntimeError(('Ambiguous device name; use '+choices) if matches else 'Device name not found: '+name)
+  d=matches[0]
+  if not d.get('eligible',True):raise RuntimeError(d.get('reason') or 'Device is not eligible')
+  if any(x['id']==d['id'] for x in selected):raise RuntimeError('Same device selected twice: '+name)
+  selected.append(d)
+ return selected
+def rescue_present():
+ devices=[(read(p/'device/name') or '',str((p/'device').resolve())) for p in (SYS/'class/input').glob('event*')]
+ return any('keyboard' in n.lower() and '/i8042/' in d for n,d in devices) and any('touchpad' in n.lower() and '/i2c-' in d for n,d in devices)
+def peripheral_ids(epc,sock):
+ return {x['name'] for x in epc['qmp'](sock,'qom-list',{'path':'/machine/peripheral'})}
+def restore_hid(devices):
+ for d in devices:
+  p=SYS/'bus/usb/devices'/d['port']
+  if not p.exists():continue
+  if read(p/'idVendor')!=d['vid'] or read(p/'idProduct')!=d['product_id']:raise RuntimeError('USB port identity changed')
+  if d['serial'] and read(p/'serial')!=d['serial']:raise RuntimeError('USB serial changed')
+  for name in d['interfaces']:
+   interface=SYS/'bus/usb/devices'/name
+   if not interface.exists():continue
+   if read(interface/'bInterfaceClass') not in ('01','03'):raise RuntimeError('Interface changed')
+   old=d.get('interface_drivers',{}).get(name,'usbhid')
+   if old is None:continue
+   if old not in ('usbhid','snd-usb-audio'):raise RuntimeError('Unexpected original USB driver: '+old)
+   if not (interface/'driver').exists():(SYS/'bus/usb/drivers'/old/'bind').write_text(name)
+   if (interface/'driver').resolve().name!=old:raise RuntimeError('Host USB driver not restored: '+name)
+def lease_path(guest):
+ return RUN/('input-lease.json' if guest=='windows' else 'device-lease-manjaro.json')
+
+def attachment(epc,sock,d):
+ return epc['qmp'](sock,'qom-get',{'path':'/machine/peripheral/'+d['id'],'property':'attached'}) is True
+
+def release(epc,lease,names=None):
+ devices=select(lease['devices'],names) if names else lease['devices']
+ selected_ids={d['id'] for d in devices}
+ session=Path(lease['session']);sock=session/'qmp.sock'
+ if session.parent!=BASE or not session.name.startswith(lease.get('guest','windows')+'-'):raise RuntimeError('Invalid device lease session')
+ try:ids=peripheral_ids(epc,sock)
+ except (OSError,ValueError):
+  pid=lease.get('pid')
+  if not pid:raise RuntimeError('Cannot prove QEMU is gone')
+  try:
+   cmd=(Path('/proc')/str(pid)/'cmdline').read_bytes()
+   if b'qemu-system' in cmd and str(sock).encode() in cmd:raise RuntimeError('QMP unavailable but QEMU alive; no rebind attempted')
+  except FileNotFoundError:pass
+  ids=set()
+ for d in devices:
+  if d['id'] in ids and d['id'] not in lease.get('deleting',[]):
+   epc['qmp'](sock,'device_del',{'id':d['id']})
+   lease.setdefault('deleting',[]).append(d['id']);epc['atomic'](lease_path(lease.get('guest','windows')),lease)
+ remaining=peripheral_ids(epc,sock) if ids else set()
+ if selected_ids & remaining:return False
+ restore_hid(devices)
+ lease['devices']=[d for d in lease['devices'] if d['id'] not in selected_ids]
+ lease['deleting']=[i for i in lease.get('deleting',[]) if i not in selected_ids]
+ if lease['devices']:epc['atomic'](lease_path(lease.get('guest','windows')),lease)
+ else:(lease_path(lease.get('guest','windows'))).unlink(missing_ok=True)
+ return True
+def give(epc,state,names,no_guest_reset=False):
+ guest=state.get('os')
+ if guest not in ('windows','manjaro') or state.get('status')!='running':raise RuntimeError('Start Guest and wait for running status first')
+ if not rescue_present():raise RuntimeError('Laptop i8042 keyboard and I2C touchpad must remain available')
+ existing=json.loads(lease_path(guest).read_text()) if lease_path(guest).exists() else None
+ if existing is not None and (existing.get('session')!=state.get('session') or existing.get('state')!='assigned' or existing.get('deleting')):raise RuntimeError('Existing/pending input lease; release it first')
+ session=Path(state['session'])
+ if session.parent!=BASE or not session.name.startswith(guest+'-'):raise RuntimeError('Invalid Guest session')
+ sock=session/'qmp.sock'
+ if epc['qmp'](sock,'query-status').get('status')!='running':raise RuntimeError('Windows not executing')
+ devices=select(discover(),names);ids=peripheral_ids(epc,sock)
+ other=lease_path('manjaro' if guest=='windows' else 'windows')
+ if other.exists():
+  occupied=json.loads(other.read_text()).get('devices',[])
+  if any(d['port']==x['port'] for d in devices for x in occupied):raise RuntimeError('Device leased to another Guest; release it there first')
+ if existing and any(d['id']==x['id'] or d.get('port') and d.get('port')==x.get('port') for d in devices for x in existing['devices']):raise RuntimeError('Device already assigned')
+ if any(d['id'] in ids for d in devices):raise RuntimeError('Untracked input device already attached')
+ lease={'guest':guest,'session':str(session),'pid':state.get('pid'),'devices':(existing['devices'] if existing else [])+devices,'state':'assigning'}
+ epc['atomic'](lease_path(lease.get('guest','windows')),lease)
+ try:
+  for d in devices:
+   props={'driver':'usb-host','id':d['id'],'hostbus':d['hostbus'],'hostaddr':d['hostaddr'],'vendorid':int(d['vid'],16),'productid':int(d['product_id'],16)}
+   if no_guest_reset:props['guest-reset']=False;props['guest-resets-all']=False
+   epc['qmp'](sock,'device_add',props)
+  # One bounded settle interval, then verify physical attachment, not just QOM object creation.
+  time.sleep(3)
+  for d in devices:
+   if not attachment(epc,sock,d):raise RuntimeError('USB device exists in QEMU but is not attached: '+d['name'])
+  lease['physical_attachment_verified']=True
+  lease['guest_input_verified']=False
+  lease['no_guest_reset']=no_guest_reset
+  lease['state']='assigned';epc['atomic'](lease_path(lease.get('guest','windows')),lease)
+ except Exception as error:
+  epc['atomic'](session/'device-last-error.json',{'error':str(error),'devices':[d['selector'] for d in devices]})
+  try:
+   if release(epc,lease,[d['selector'] for d in devices]) and existing:
+    lease['state']='assigned';epc['atomic'](lease_path(lease.get('guest','windows')),lease)
+  except Exception:pass
+  raise
+def main():
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('action',choices=['list','give','release','status']);p.add_argument('guest',nargs='?',type=lambda x:'manjaro' if x=='linux' else x,choices=['windows','manjaro'],default='windows');p.add_argument('devices',nargs='*',help='Exact names from list; use name@port for duplicate names');p.add_argument('--no-guest-reset',action='store_true',help='Compatibility experiment: prevent Guest USB reset commands');p.add_argument('--json',action='store_true',help='Machine-readable device list');a=p.parse_args()
+ if a.action=='list':
+  devices=discover();rescue=rescue_present()
+  if a.json:print(json.dumps({'devices':devices,'laptop_rescue_input':rescue},indent=2,ensure_ascii=False))
+  else:
+   for d in devices:
+    print(('READY   ' if d['eligible'] else 'BLOCKED ')+json.dumps(d['name'],ensure_ascii=False)+'  '+json.dumps(d['selector'],ensure_ascii=False))
+   print('Laptop Host input: '+('available' if rescue else 'NOT confirmed; assignment will be refused'))
+  return
+ epc=runpy.run_path('/usr/local/bin/epc',run_name='input_helpers');epc['host_guard'](json.loads(Path('/etc/elasticpc/runtime.json').read_text()));RUN.mkdir(exist_ok=True)
+ lock=os.open(RUN/'input.lock',os.O_CREAT|os.O_RDWR,0o600)
+ try:
+  fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);path=lease_path(a.guest)
+  if a.action=='status':
+   if not path.exists():print('No active device lease');return
+   lease=json.loads(path.read_text());sock=Path(lease['session'])/'qmp.sock'
+   for d in lease['devices']:
+    try:d['attached_now']=attachment(epc,sock,d)
+    except Exception as e:d['attachment_error']=str(e)
+   epc['atomic'](Path(lease['session'])/'device-diagnostics.json',lease)
+   print(json.dumps(lease,indent=2,ensure_ascii=False));return
+  if a.action=='give':give(epc,json.loads((BASE/(a.guest+'-latest.json')).read_text()),a.devices,a.no_guest_reset);print('USB attachment verified; Guest driver/input still requires testing. Laptop input remains with Host.')
+  elif not path.exists():print('No active input lease')
+  else:print('External input returned to Host.' if release(epc,json.loads(path.read_text()),a.devices) else 'Deletion pending; run release again. Lease retained.')
+ finally:os.close(lock)
+if __name__=='__main__':
+ try:main()
+ except Exception as e:print('REFUSED/FAILED: '+str(e),file=sys.stderr);sys.exit(1)

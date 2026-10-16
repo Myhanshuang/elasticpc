@@ -1,0 +1,25 @@
+/target/
+/reports/local-*
+*.qcow2
+*.raw
+
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.controller.lock
+
+__pycache__/
+*.pyc
+
+/.elasticpc/
+
+# Local credentials, generated reports and agent state
+/reports/
+/.aws/
+/.codex/
+/.agents/
+local-login.txt
+console-password.txt
+*.img
+*.iso

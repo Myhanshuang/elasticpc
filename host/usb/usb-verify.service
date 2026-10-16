@@ -1,0 +1,9 @@
+[Unit]
+Description=Explicit-seed USB boot verification
+After=elasticpc-host.service NetworkManager.service
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/elasticpc/usb-verify
+StandardOutput=journal+console
+[Install]
+WantedBy=multi-user.target
